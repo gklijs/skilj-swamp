@@ -1,7 +1,9 @@
 /**
  * Swamp model for the REST surface of a running SkilJ deployment
  * (https://codeberg.org/gklijs/SkilJ): trigger or dry-run commands, read
- * events, and write external or direct events.
+ * events with a client-tracked cursor or a server-tracked consume cursor,
+ * acknowledge consumed events, write external or direct events, and report
+ * parked broker deliveries.
  *
  * SkilJ access tokens are capability-scoped: one token authorizes exactly
  * one route kind for one command or event type. Create one model instance
@@ -23,6 +25,11 @@ export const GlobalArgsSchema = z.object({
   timeoutMs: z.number().int().positive().default(10000).describe(
     "Per-request timeout in milliseconds",
   ),
+  maxRetries: z.number().int().min(0).max(10).default(2).describe(
+    "Retries for transient failures (timeouts, 408/429/502/503/504) on " +
+      "side-effect-free calls and on writes protected by an idempotency key " +
+      "or dedupe cursor; other writes are never retried",
+  ),
 });
 
 /** Validated global arguments. */
@@ -39,6 +46,12 @@ const TraceArgs = {
 
 const IdempotencyKeyArg = z.string().min(1).optional().describe(
   "Sent as the Idempotency-Key header so retries are recognised",
+);
+
+const FilterArg = z.array(z.string()).default([]).describe(
+  "Payload filters as 'field:op:value' with op one of equals, contains, " +
+    "is_like, greater_than, less_than, near, similar_color, in_subnet, in - " +
+    "e.g. 'amount:greater_than:100'",
 );
 
 /** Arguments for `triggerCommand`. */
@@ -59,9 +72,7 @@ export const DryRunCommandArgsSchema = z.object({
 
 /** Arguments for `fetchEvents`. */
 export const FetchEventsArgsSchema = z.object({
-  filters: z.array(z.string()).default([]).describe(
-    "Payload filters as 'field:op:value', e.g. 'amount:greater_than:100'",
-  ),
+  filters: FilterArg,
   after: z.string().optional().describe(
     "Start after this cursor (a previous nextCursor, or a bare sequence)",
   ),
@@ -73,6 +84,26 @@ export const FetchEventsArgsSchema = z.object({
   ),
   maxPages: z.number().int().positive().max(100).default(1).describe(
     "Follow nextCursor for up to this many pages",
+  ),
+});
+
+/** Arguments for `consumeEvents`. */
+export const ConsumeEventsArgsSchema = z.object({
+  filters: FilterArg,
+  mode: z.enum(["auto", "manual"]).optional().describe(
+    "Server-tracked cursor mode: required on the token's first consume " +
+      "call, afterwards the cursor's own mode applies and a different mode " +
+      "is refused",
+  ),
+});
+
+/** Arguments for `acknowledgeEvents`. */
+export const AcknowledgeEventsArgsSchema = z.object({
+  sequence: z.number().int().describe(
+    "Advance a manual_ack cursor up to this served sequence",
+  ),
+  epoch: z.string().optional().describe(
+    "Epoch from the consume response that served the sequence",
   ),
 });
 
@@ -101,6 +132,36 @@ export const IngestExternalEventArgsSchema = z.object({
 export const CreateDirectEventArgsSchema = z.object({
   payload: z.record(z.string(), z.unknown()).describe("The event payload"),
   ...TraceArgs,
+});
+
+/** Arguments for `reportParkedDelivery`. */
+export const ReportParkedDeliveryArgsSchema = z.object({
+  source: z.string().min(1).describe(
+    "The bridge's own name for itself, e.g. 'kafka-inbound'",
+  ),
+  kind: z.enum(["external_event", "command_trigger"]).describe(
+    "Which original route the delivery was bound for",
+  ),
+  identifier: z.string().min(1).describe(
+    "Broker-native message id, e.g. '{topic}:{partition}:{offset}'",
+  ),
+  error: z.string().min(1).describe(
+    "Why the bridge gave up retrying this delivery",
+  ),
+  attemptCount: z.number().int().nonnegative().describe(
+    "How many delivery attempts the bridge made",
+  ),
+  firstFailedAt: z.string().min(1).describe(
+    "ISO-8601 timestamp of the first failed attempt",
+  ),
+  request: z.record(z.string(), z.unknown()).describe(
+    "The verbatim original POST body for the delivery, in the shape the " +
+      "kind's own route takes",
+  ),
+  idempotencyKey: z.string().min(1).optional().describe(
+    "The Idempotency-Key header the original POST carried, if any - " +
+      "refused together with a watermark dedupe cursor in 'request'",
+  ),
 });
 
 const CommandResultSchema = z.object({
@@ -132,11 +193,15 @@ const EventSchema = z.object({
   }),
 });
 
-const EventsSchema = z.object({
+const EventTypeInfo = {
   eventTypeName: z.string(),
   eventTypeSchema: z.string(),
   eventTypeSchemaVersion: z.number(),
   epoch: z.string(),
+};
+
+const EventsSchema = z.object({
+  ...EventTypeInfo,
   events: z.array(EventSchema),
   nextCursor: z.string().nullable().describe(
     "Pass as 'after' on the next call to continue",
@@ -147,6 +212,20 @@ const EventsSchema = z.object({
   ),
 });
 
+const ConsumedEventsSchema = z.object({
+  ...EventTypeInfo,
+  mode: z.enum(["auto", "manual"]).nullable().describe(
+    "The mode this call consumed under, when the caller stated one",
+  ),
+  events: z.array(EventSchema),
+  count: z.number().describe("How many events this call served"),
+});
+
+const AckSchema = z.object({
+  sequence: z.number().describe("The sequence the cursor was advanced to"),
+  epoch: z.string().nullable().describe("Epoch the ack was recorded in"),
+});
+
 const EventWriteSchema = z.object({
   kind: z.enum(["external", "direct"]),
   sequence: z.number().nullable().describe(
@@ -155,6 +234,13 @@ const EventWriteSchema = z.object({
   redelivered: z.boolean().describe(
     "True when the message had already been ingested before",
   ),
+});
+
+const ParkedDeliverySchema = z.object({
+  id: z.string().describe("Id of the stored parked delivery"),
+  kind: z.enum(["external_event", "command_trigger"]),
+  source: z.string(),
+  identifier: z.string(),
 });
 
 /** Minimal logger shape used by the model. */
@@ -199,11 +285,24 @@ export class SkiljApiError extends Error {
   }
 }
 
+function isRetryableStatus(status: number): boolean {
+  return status === 408 || status === 429 || status >= 502 &&
+      status <= 504;
+}
+
+function backoffMs(attempt: number): number {
+  return Math.min(200 * 2 ** attempt, 2000);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function request(
   globalArgs: GlobalArgs,
   method: "GET" | "POST",
   path: string,
-  options: { body?: unknown; idempotencyKey?: string } = {},
+  options: { body?: unknown; idempotencyKey?: string; retry?: boolean } = {},
 ): Promise<Record<string, unknown>> {
   const url = new URL(path, globalArgs.baseUrl.replace(/\/?$/, "/"));
   const headers: Record<string, string> = {
@@ -216,49 +315,66 @@ async function request(
   }
 
   const route = `${method} ${url.pathname}`;
-  let response: Response;
-  try {
-    response = await fetch(url, {
-      method,
-      headers,
-      body: options.body === undefined
-        ? undefined
-        : JSON.stringify(options.body),
-      signal: AbortSignal.timeout(globalArgs.timeoutMs),
-    });
-  } catch (err) {
-    const reason = err instanceof DOMException && err.name === "TimeoutError"
-      ? `timed out after ${globalArgs.timeoutMs}ms`
-      : String(err);
-    throw new Error(`SkilJ ${route} could not be reached: ${reason}`, {
-      cause: err,
-    });
+  const maxAttempts = options.retry
+    ? 1 + Math.min(Math.max(globalArgs.maxRetries ?? 0, 0), 10)
+    : 1;
+  for (let attempt = 0;; attempt++) {
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        method,
+        headers,
+        body: options.body === undefined
+          ? undefined
+          : JSON.stringify(options.body),
+        signal: AbortSignal.timeout(globalArgs.timeoutMs),
+      });
+    } catch (err) {
+      if (attempt + 1 < maxAttempts) {
+        await sleep(backoffMs(attempt));
+        continue;
+      }
+      const reason = err instanceof DOMException && err.name === "TimeoutError"
+        ? `timed out after ${globalArgs.timeoutMs}ms`
+        : String(err);
+      throw new Error(`SkilJ ${route} could not be reached: ${reason}`, {
+        cause: err,
+      });
+    }
+    const text = await response.text();
+    let json: unknown = null;
+    try {
+      json = text ? JSON.parse(text) : null;
+    } catch {
+      // Non-JSON body, reported below.
+    }
+    if (!response.ok) {
+      if (attempt + 1 < maxAttempts && isRetryableStatus(response.status)) {
+        await sleep(backoffMs(attempt));
+        continue;
+      }
+      const body = json as { code?: string; message?: string } | null;
+      throw new SkiljApiError(
+        route,
+        response.status,
+        body?.code ?? null,
+        body?.message ?? (text.slice(0, 500) || response.statusText),
+      );
+    }
+    if (json === null || typeof json !== "object" || Array.isArray(json)) {
+      if (attempt + 1 < maxAttempts) {
+        await sleep(backoffMs(attempt));
+        continue;
+      }
+      throw new SkiljApiError(
+        route,
+        response.status,
+        null,
+        `expected a JSON object, got: ${text.slice(0, 200)}`,
+      );
+    }
+    return json as Record<string, unknown>;
   }
-  const text = await response.text();
-  let json: unknown = null;
-  try {
-    json = text ? JSON.parse(text) : null;
-  } catch {
-    // Non-JSON body, reported below.
-  }
-  if (!response.ok) {
-    const body = json as { code?: string; message?: string } | null;
-    throw new SkiljApiError(
-      route,
-      response.status,
-      body?.code ?? null,
-      body?.message ?? (text.slice(0, 500) || response.statusText),
-    );
-  }
-  if (json === null || typeof json !== "object" || Array.isArray(json)) {
-    throw new SkiljApiError(
-      route,
-      response.status,
-      null,
-      `expected a JSON object, got: ${text.slice(0, 200)}`,
-    );
-  }
-  return json as Record<string, unknown>;
 }
 
 function eventsPath(
@@ -272,6 +388,14 @@ function eventsPath(
   if (args.correlationId) params.set("correlationId", args.correlationId);
   const query = params.toString();
   return query ? `v1/events?${query}` : "v1/events";
+}
+
+function consumePath(args: z.infer<typeof ConsumeEventsArgsSchema>): string {
+  const params = new URLSearchParams();
+  for (const filter of args.filters) params.append("filter", filter);
+  if (args.mode) params.set("mode", args.mode);
+  const query = params.toString();
+  return query ? `v1/events/consume?${query}` : "v1/events/consume";
 }
 
 function toEvent(raw: Record<string, unknown>): z.infer<typeof EventSchema> {
@@ -292,10 +416,27 @@ function toEvent(raw: Record<string, unknown>): z.infer<typeof EventSchema> {
   });
 }
 
+function toEventTypeInfo(
+  body: Record<string, unknown>,
+  epoch: string,
+): z.infer<typeof EventsSchema>["eventTypeName"] extends never ? never : {
+  eventTypeName: string;
+  eventTypeSchema: string;
+  eventTypeSchemaVersion: number;
+  epoch: string;
+} {
+  return {
+    eventTypeName: String(body.eventTypeName ?? ""),
+    eventTypeSchema: String(body.eventTypeSchema ?? ""),
+    eventTypeSchemaVersion: Number(body.eventTypeSchemaVersion ?? 0),
+    epoch,
+  };
+}
+
 /** The `@gklijs/skilj` model definition. */
 export const model = {
   type: "@gklijs/skilj",
-  version: "2026.10.14.1",
+  version: "2026.10.14.2",
   globalArguments: GlobalArgsSchema,
 
   resources: {
@@ -311,9 +452,28 @@ export const model = {
       lifetime: "30d" as const,
       garbageCollection: 20,
     },
+    consumedEvents: {
+      description:
+        "Events served from a server-tracked consume cursor with an EventRead token",
+      schema: ConsumedEventsSchema,
+      lifetime: "30d" as const,
+      garbageCollection: 20,
+    },
+    ack: {
+      description: "Record of a manual_ack cursor acknowledgement",
+      schema: AckSchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 50,
+    },
     eventWrite: {
       description: "Result of writing an external or direct event",
       schema: EventWriteSchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 50,
+    },
+    parkedDelivery: {
+      description: "A bridge's parked-delivery report stored by SkilJ",
+      schema: ParkedDeliverySchema,
       lifetime: "infinite" as const,
       garbageCollection: 50,
     },
@@ -340,6 +500,9 @@ export const model = {
               causationId: args.causationId,
             },
             idempotencyKey: args.idempotencyKey,
+            // Safe to retry only under an idempotency key: without one a
+            // retried POST could store the command twice.
+            retry: args.idempotencyKey !== undefined,
           },
         );
         const result = CommandResultSchema.parse({
@@ -385,6 +548,8 @@ export const model = {
           "v1/commands/dry-run",
           {
             body: { payload: args.payload },
+            // Stores nothing, so always safe to retry.
+            retry: true,
           },
         );
         const result = CommandResultSchema.parse({
@@ -432,14 +597,26 @@ export const model = {
             context.globalArgs,
             "GET",
             eventsPath(args, cursor),
+            // A read: always safe to retry.
+            { retry: true },
           );
           first ??= body;
           pages++;
+          const pageEpoch = typeof body.epoch === "string" ? body.epoch : "";
+          if (epoch && pageEpoch && pageEpoch !== epoch) {
+            throw new SkiljApiError(
+              "GET /v1/events",
+              409,
+              "epoch_changed",
+              `database epoch changed mid-read from ${epoch} to ${pageEpoch} ` +
+                `- start over from the latest nextCursor`,
+            );
+          }
+          if (pageEpoch) epoch = pageEpoch;
           const page = Array.isArray(body.events) ? body.events : [];
           events.push(
             ...page.map((e) => toEvent(e as Record<string, unknown>)),
           );
-          epoch = String(body.epoch ?? "");
           const next = typeof body.nextCursor === "string"
             ? body.nextCursor
             : null;
@@ -448,10 +625,7 @@ export const model = {
           if (lastPageEmpty || next === null) break;
         }
         const result = EventsSchema.parse({
-          eventTypeName: first?.eventTypeName,
-          eventTypeSchema: first?.eventTypeSchema,
-          eventTypeSchemaVersion: first?.eventTypeSchemaVersion,
-          epoch,
+          ...toEventTypeInfo(first ?? {}, epoch),
           events,
           nextCursor: cursor ?? null,
           pages,
@@ -462,6 +636,74 @@ export const model = {
           pages,
         });
         const handle = await context.writeResource("events", "events", result);
+        return { dataHandles: [handle] };
+      },
+    },
+
+    consumeEvents: {
+      description:
+        "Serve the token's event type from its server-tracked cursor (GET /v1/events/consume); the cursor advances itself, nothing is passed back",
+      arguments: ConsumeEventsArgsSchema,
+      execute: async (
+        args: z.infer<typeof ConsumeEventsArgsSchema>,
+        context: SkiljContext,
+      ): Promise<{ dataHandles: { name: string }[] }> => {
+        context.logger.info("Consuming SkilJ events in {mode} mode", {
+          mode: args.mode ?? "cursor's own",
+        });
+        const body = await request(
+          context.globalArgs,
+          "GET",
+          consumePath(args),
+          // A read: always safe to retry.
+          { retry: true },
+        );
+        const served = Array.isArray(body.events) ? body.events : [];
+        const result = ConsumedEventsSchema.parse({
+          ...toEventTypeInfo(body, String(body.epoch ?? "")),
+          mode: args.mode ?? null,
+          events: served.map((e) => toEvent(e as Record<string, unknown>)),
+          count: served.length,
+        });
+        context.logger.info("Consumed {count} event(s)", {
+          count: result.count,
+        });
+        const handle = await context.writeResource(
+          "consumedEvents",
+          "consume",
+          result,
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+
+    acknowledgeEvents: {
+      description:
+        "Advance a manual_ack consume cursor (POST /v1/events/consume/ack) up to a served sequence",
+      arguments: AcknowledgeEventsArgsSchema,
+      execute: async (
+        args: z.infer<typeof AcknowledgeEventsArgsSchema>,
+        context: SkiljContext,
+      ): Promise<{ dataHandles: { name: string }[] }> => {
+        context.logger.info("Acknowledging SkilJ events up to {sequence}", {
+          sequence: args.sequence,
+        });
+        await request(
+          context.globalArgs,
+          "POST",
+          "v1/events/consume/ack",
+          {
+            body: { sequence: args.sequence, epoch: args.epoch },
+            // Re-acknowledging the same sequence is a no-op success, so a
+            // retry can never move the cursor twice.
+            retry: true,
+          },
+        );
+        const result = AckSchema.parse({
+          sequence: args.sequence,
+          epoch: args.epoch ?? null,
+        });
+        const handle = await context.writeResource("ack", "ack", result);
         return { dataHandles: [handle] };
       },
     },
@@ -489,6 +731,10 @@ export const model = {
               causationId: args.causationId,
             },
             idempotencyKey: args.idempotencyKey,
+            // Safe to retry only under a dedupe mechanism: the server
+            // recognises either as the same message.
+            retry: args.idempotencyKey !== undefined ||
+              args.dedupe !== undefined,
           },
         );
         const result = EventWriteSchema.parse({
@@ -529,6 +775,7 @@ export const model = {
               correlationId: args.correlationId,
               causationId: args.causationId,
             },
+            // Every call stores a fresh event: never retried.
           },
         );
         const result = EventWriteSchema.parse({
@@ -542,6 +789,64 @@ export const model = {
         const handle = await context.writeResource(
           "eventWrite",
           "direct",
+          result,
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+
+    reportParkedDelivery: {
+      description:
+        "Report a broker delivery the bridge gave up retrying (POST /v1/parked-deliveries), for a later retryParkedDelivery",
+      arguments: ReportParkedDeliveryArgsSchema,
+      execute: async (
+        args: z.infer<typeof ReportParkedDeliveryArgsSchema>,
+        context: SkiljContext,
+      ): Promise<{ dataHandles: { name: string }[] }> => {
+        const dedupe = (args.request.dedupe ?? null) as unknown;
+        if (
+          args.kind === "external_event" && dedupe !== null &&
+          args.idempotencyKey !== undefined
+        ) {
+          throw new Error(
+            "SkilJ POST /v1/parked-deliveries refused: 'request' carries a " +
+              "watermark dedupe cursor and 'idempotencyKey' is also set " +
+              "(dedupe_and_idempotency_key) - pass one or the other",
+          );
+        }
+        context.logger.info("Reporting parked SkilJ delivery from {source}", {
+          source: args.source,
+        });
+        const body = await request(
+          context.globalArgs,
+          "POST",
+          "v1/parked-deliveries",
+          {
+            body: {
+              source: args.source,
+              kind: args.kind,
+              identifier: args.identifier,
+              error: args.error,
+              attemptCount: args.attemptCount,
+              firstFailedAt: args.firstFailedAt,
+              request: args.request,
+              idempotencyKey: args.idempotencyKey,
+            },
+            // Every call stores a fresh parked delivery: never retried.
+          },
+        );
+        const result = ParkedDeliverySchema.parse({
+          id: body.id,
+          kind: args.kind,
+          source: args.source,
+          identifier: args.identifier,
+        });
+        context.logger.info("Parked delivery stored as {id}", {
+          id: result.id,
+        });
+        const handle = await context.writeResource(
+          "parkedDelivery",
+          "parked",
           result,
         );
         return { dataHandles: [handle] };

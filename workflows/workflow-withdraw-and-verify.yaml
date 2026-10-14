@@ -1,0 +1,106 @@
+id: 8a03b69f-21ca-4c88-976e-4323dacc30a2
+name: "@gklijs/withdraw-and-verify"
+description: >-
+  Trigger a withdrawal command, assert decide() accepted it, then read back
+  the stored event. Runnable documentation for @gklijs/skilj: shows the
+  trigger-then-fetch wiring, cursor passing, and the accepted guard.
+inputs:
+  type: object
+  additionalProperties: false
+  properties:
+    commandModel:
+      type: string
+      minLength: 1
+      description: Model bound to the withdrawal CommandToken.
+    eventsModel:
+      type: string
+      minLength: 1
+      description: Model bound to the Withdrawn EventReadToken.
+    walletId:
+      type: string
+      minLength: 1
+    amount:
+      type: number
+      exclusiveMinimum: 0
+    idempotencyKey:
+      type: string
+      minLength: 1
+      description: Idempotency key for the trigger, so a retried run deduplicates.
+  required: [commandModel, eventsModel, walletId, amount, idempotencyKey]
+jobs:
+  - name: withdraw-and-verify
+    steps:
+      - name: dry-run
+        description: Check decide() would accept the withdrawal without storing anything.
+        task:
+          type: model_method
+          modelIdOrName: "${{ inputs.commandModel }}"
+          methodName: dryRunCommand
+          inputs:
+            payload:
+              wallet_id: "${{ inputs.walletId }}"
+              amount: "${{ inputs.amount }}"
+        dependsOn: []
+        weight: 0
+        allowFailure: false
+      - name: assert-dry-run-accepted
+        description: Stop when the dry run says decide() would reject.
+        dependsOn:
+          - step: dry-run
+            condition: { type: succeeded }
+        task:
+          type: assert
+          expr: >-
+            data.latest(inputs.commandModel, "commandResult").attributes.accepted
+          message: >-
+            Dry run rejected the withdrawal - inspect the commandResult rejectionReason before triggering.
+          severity: high
+        weight: 0
+        allowFailure: false
+      - name: trigger
+        description: Trigger the withdrawal under the idempotency key.
+        task:
+          type: model_method
+          modelIdOrName: "${{ inputs.commandModel }}"
+          methodName: triggerCommand
+          inputs:
+            payload:
+              wallet_id: "${{ inputs.walletId }}"
+              amount: "${{ inputs.amount }}"
+            idempotencyKey: "${{ inputs.idempotencyKey }}"
+        dependsOn:
+          - step: assert-dry-run-accepted
+            condition: { type: succeeded }
+        weight: 0
+        allowFailure: false
+      - name: assert-accepted
+        description: Stop when decide() rejected the trigger.
+        dependsOn:
+          - step: trigger
+            condition: { type: succeeded }
+        task:
+          type: assert
+          expr: >-
+            data.latest(inputs.commandModel, "commandResult").attributes.accepted
+          message: >-
+            ${{ data.latest(inputs.commandModel, "commandResult").attributes.rejectionReason }}
+          severity: high
+        weight: 0
+        allowFailure: false
+      - name: read-back
+        description: Read the event type back to confirm the withdrawal landed.
+        task:
+          type: model_method
+          modelIdOrName: "${{ inputs.eventsModel }}"
+          methodName: fetchEvents
+          inputs:
+            filters: []
+            maxPages: 1
+        dependsOn:
+          - step: assert-accepted
+            condition: { type: succeeded }
+        weight: 0
+        allowFailure: false
+    dependsOn: []
+    weight: 0
+version: 1

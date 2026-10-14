@@ -1,10 +1,15 @@
 manifestVersion: 1
 name: "@gklijs/skilj"
-version: "2026.10.14.1"
-description: "Trigger and dry-run commands, read events and ingest external events on a SkilJ (event-sourced, DCB) server over its REST API."
+version: "2026.10.14.2"
+description: "Trigger and dry-run commands, read or consume events, acknowledge consume cursors, ingest external events, store direct events and report parked deliveries on a SkilJ (event-sourced, DCB) server over its REST API."
 repository: "https://github.com/gklijs/skilj-swamp"
+license: MIT
 models:
   - skilj.ts
+workflows:
+  - workflow-withdraw-and-verify.yaml
+reports:
+  - skilj_report.ts
 additionalFiles:
   - README.md
   - LICENSE
