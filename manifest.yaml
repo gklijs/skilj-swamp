@@ -2,7 +2,7 @@ manifestVersion: 1
 name: "@gklijs/skilj"
 version: "2026.10.14.1"
 description: "Trigger and dry-run commands, read events and ingest external events on a SkilJ (event-sourced, DCB) server over its REST API."
-repository: "https://codeberg.org/gklijs/skilj-swamp"
+repository: "https://github.com/gklijs/skilj-swamp"
 models:
   - skilj.ts
 additionalFiles:
