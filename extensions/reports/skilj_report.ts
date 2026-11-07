@@ -78,6 +78,13 @@ async function loadFirst(
 }
 
 function commandSummary(data: Rec): string[] {
+  if (data.pendingApproval === true) {
+    return [
+      `Awaiting approval; proposal \`${
+        String(data.proposalId ?? "?")
+      }\`. No command events stored.`,
+    ];
+  }
   if (data.accepted === true) {
     const seqs = Array.isArray(data.triggeredEventSequences)
       ? data.triggeredEventSequences.map((s) => String(s)).join(", ")
@@ -109,6 +116,9 @@ function eventsSummary(data: Rec): string[] {
     );
   }
   if (events.length > 10) lines.push(`- … and ${events.length - 10} more`);
+  if (data.nextCursor) {
+    lines.push(`Continue after \`${String(data.nextCursor)}\`.`);
+  }
   return lines;
 }
 
@@ -119,7 +129,12 @@ function consumedSummary(
   const lines = eventsSummary(data);
   lines[0] += ` Consumed under \`${
     String(data.mode ?? methodArgs.mode ?? "cursor's own")
-  }\` mode - acknowledge with acknowledgeEvents when mode is manual.`;
+  }\` mode.`;
+  if ((data.mode ?? methodArgs.mode) === "manual") {
+    lines.push(
+      "Acknowledge the last served sequence and epoch with acknowledgeEvents.",
+    );
+  }
   return lines;
 }
 
@@ -156,7 +171,18 @@ export const report = {
     const data = context.executionStatus === "succeeded"
       ? await loadFirst(context)
       : null;
-    if (!data) {
+    if (
+      context.modelType === "@gklijs/skilj-graphql" &&
+      (context.methodName === "exportSchema" ||
+        context.methodName === "exportSchemaSdl") &&
+      context.executionStatus === "succeeded"
+    ) {
+      lines.push(
+        context.methodName === "exportSchemaSdl"
+          ? "Exported sorted GraphQL SDL for frontend tooling."
+          : "Exported GraphQL introspection JSON for frontend tooling.",
+      );
+    } else if (!data) {
       lines.push(
         context.executionStatus === "succeeded"
           ? `No data artifact to summarise.`
@@ -183,6 +209,126 @@ export const report = {
       context.methodName === "createDirectEvent"
     ) {
       lines.push(...eventWriteSummary(data));
+    } else if (context.modelType === "@gklijs/skilj-graphql") {
+      if (context.methodName === "compareSchema") {
+        lines.push(
+          `Schema ${data.changed === true ? "changed" : "unchanged"}; ${
+            String(data.breakingCount)
+          } breaking and ${
+            String(data.dangerousCount)
+          } potentially risky change(s). ${
+            data.compatible === true
+              ? "No known breaking changes."
+              : "Existing clients may break."
+          } Change details are vault-protected.`,
+        );
+      } else if (context.methodName === "listCommandProposals") {
+        lines.push(
+          `${String(data.count)} proposal(s) in ${String(data.pages)} page(s)${
+            data.truncated === true ? " (truncated; more may follow)" : ""
+          }. No approval decision made.`,
+        );
+      } else if (
+        context.methodName === "approveCommand" ||
+        context.methodName === "rejectCommand"
+      ) {
+        lines.push(
+          context.methodName === "rejectCommand"
+            ? `Rejected proposal \`${
+              String(data.proposalId)
+            }\`; no command executed.`
+            : `Processed approval for proposal \`${
+              String(data.proposalId)
+            }\`; command ${
+              data.accepted === true ? "accepted" : "rejected by domain rules"
+            }, ${
+              (data.triggeredEventSequences as unknown[] | undefined)?.length ??
+                0
+            } event(s).`,
+        );
+      } else if (context.methodName === "validateOperation") {
+        lines.push(
+          `GraphQL operation ${
+            data.valid === true ? "is valid" : "is invalid"
+          }; ${
+            String(data.errorCount)
+          } validation error(s). No operation executed.`,
+        );
+      } else if (context.methodName === "revokeAccessToken") {
+        lines.push(
+          `Revoked token \`${String(data.id)}\` (${
+            String(data.tokenType)
+          }) at ${String(data.revokedAt)}.`,
+        );
+      } else if (context.methodName === "debugCommand" && data.commandSummary) {
+        const summary = data.commandSummary as Rec;
+        lines.push(
+          `Dry run ${summary.accepted === true ? "accepted" : "rejected"}; ${
+            String(summary.wouldBeEventCount)
+          } would-be event(s), ${
+            String(summary.matchingEventCount)
+          } matching event(s)${
+            summary.matchingEventsTruncated === true
+              ? " (history truncated)"
+              : ""
+          }. Nothing stored in SkilJ.`,
+        );
+      } else if (context.methodName === "introspect") {
+        lines.push("Recorded GraphQL schema for frontend tooling.");
+      } else if (context.methodName === "createAccessToken") {
+        lines.push(
+          `Created ${String(data.kind)} token \`${
+            String(data.id)
+          }\`; credential protected by the vault.`,
+        );
+      } else {
+        lines.push(
+          `GraphQL ${
+            data.succeeded === true ? "succeeded" : "returned errors"
+          }; ${
+            String(data.errorCount ?? 0)
+          } error(s). Data and errors are vault-protected; inspect the result before continuing.`,
+        );
+      }
+    } else if (
+      context.methodName === "triggerCommands" ||
+      context.methodName === "ingestExternalEvents"
+    ) {
+      lines.push(
+        context.methodName === "triggerCommands"
+          ? `${String(data.count)} command(s): ${
+            String(data.accepted)
+          } accepted, ${String(data.rejected)} rejected, ${
+            String(data.pending)
+          } awaiting approval, ${String(data.failed)} failed.`
+          : `${String(data.count)} event(s): ${String(data.stored)} stored, ${
+            String(data.redelivered)
+          } redelivered, ${String(data.failed)} failed.`,
+      );
+      const outcomes = Array.isArray(data.outcomes) ? data.outcomes : [];
+      for (const [index, item] of outcomes.slice(0, 10).entries()) {
+        const outcome = item as Rec;
+        const error = outcome.error as Rec | undefined;
+        lines.push(
+          `- Item ${index + 1}: ` +
+            (error
+              ? `HTTP ${String(error.status)} (${String(error.code)}): ${
+                fmtValue(error.message)
+              }`
+              : context.methodName === "triggerCommands"
+              ? commandSummary(outcome)[0]
+              : eventWriteSummary(outcome)[0]),
+        );
+      }
+      if (outcomes.length > 10) {
+        lines.push(`- … and ${outcomes.length - 10} more`);
+      }
+    } else if (context.methodName === "searchUsedTags") {
+      lines.push(
+        `${String(data.count)} used tag value(s) for \`${
+          String(data.key)
+        }\` (prefix \`${String(data.prefix)}\`).`,
+      );
     } else if (context.methodName === "reportParkedDelivery") {
       lines.push(
         `Parked delivery stored as \`${String(data.id ?? "?")}\` ` +

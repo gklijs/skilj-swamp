@@ -1,0 +1,16 @@
+{
+  "tasks": {
+    "test": "deno test --allow-env=NODE_ENV extensions/models extensions/reports",
+    "check": "deno check extensions/models/skilj.ts extensions/models/skilj_graphql.ts extensions/reports/skilj_report.ts tests/skilj_live_test.ts",
+    "lint": "deno lint extensions tests",
+    "fmt:check": "deno fmt --check extensions tests README.md manifest.yaml deno.json .claude/skills workflows .github",
+    "test:live": "deno test --allow-net=127.0.0.1 --allow-env=NODE_ENV,SKILJ_TEST_URL,SKILJ_TEST_JWT,SKILJ_TEST_PREFIX tests/skilj_live_test.ts"
+  },
+  "lint": {
+    "rules": {
+      "exclude": [
+        "no-import-prefix"
+      ]
+    }
+  }
+}

@@ -1,0 +1,127 @@
+id: 5611e209-1066-4130-a9a0-1717eaf9947b
+name: "@gklijs/skilj-command-and-verify"
+description: >-
+  Dry-run an arbitrary command payload, trigger it under an idempotency key,
+  then assert the event reader sees a sequence produced by that command.
+inputs:
+  type: object
+  additionalProperties: false
+  properties:
+    commandModel:
+      type: string
+      minLength: 1
+      description: Model bound to the command type capability.
+    eventsModel:
+      type: string
+      minLength: 1
+      description: Model bound to the expected event type capability.
+    payload:
+      type: object
+      additionalProperties: true
+      description: Command payload matching the token's registered command type.
+    idempotencyKey:
+      type: string
+      minLength: 1
+      description: Idempotency key for the trigger, so a retried run deduplicates.
+  required: [commandModel, eventsModel, payload, idempotencyKey]
+jobs:
+  - name: command-and-verify
+    steps:
+      - name: dry-run
+        description: Check decide() would accept the command without storing anything.
+        task:
+          type: model_method
+          modelIdOrName: "${{ inputs.commandModel }}"
+          methodName: dryRunCommand
+          inputs:
+            payload: "${{ inputs.payload }}"
+        dependsOn: []
+        weight: 0
+        allowFailure: false
+      - name: assert-dry-run-accepted
+        description: Stop when the dry run says decide() would reject.
+        dependsOn:
+          - step: dry-run
+            condition: { type: succeeded }
+        task:
+          type: assert
+          expr: >-
+            data.latest(inputs.commandModel, "dryRun").attributes.accepted
+          message: >-
+            Dry run rejected the command - inspect the commandResult rejectionReason before triggering.
+          severity: high
+        weight: 0
+        allowFailure: false
+      - name: trigger
+        description: Trigger the command under the idempotency key.
+        task:
+          type: model_method
+          modelIdOrName: "${{ inputs.commandModel }}"
+          methodName: triggerCommand
+          inputs:
+            payload: "${{ inputs.payload }}"
+            idempotencyKey: "${{ inputs.idempotencyKey }}"
+        dependsOn:
+          - step: assert-dry-run-accepted
+            condition: { type: succeeded }
+        weight: 0
+        allowFailure: false
+      - name: assert-accepted
+        description: Stop when the command was rejected or awaits approval.
+        dependsOn:
+          - step: trigger
+            condition: { type: succeeded }
+        task:
+          type: assert
+          expr: >-
+            data.latest(inputs.commandModel, "trigger").attributes.accepted
+          message: >-
+            Command did not store events; inspect commandResult for rejection or pending approval.
+          severity: high
+        weight: 0
+        allowFailure: false
+      - name: assert-produced-events
+        description: A command must produce at least one stored event.
+        dependsOn:
+          - step: assert-accepted
+            condition: { type: succeeded }
+        task:
+          type: assert
+          expr: >-
+            size(data.latest(inputs.commandModel, "trigger").attributes.triggeredEventSequences) > 0
+          message: Command was accepted but did not produce an event.
+          severity: high
+        weight: 0
+        allowFailure: false
+      - name: read-back
+        description: Read the event type back to confirm the command landed.
+        task:
+          type: model_method
+          modelIdOrName: "${{ inputs.eventsModel }}"
+          methodName: fetchEvents
+          inputs:
+            filters: []
+            after: "${{ string(data.latest(inputs.commandModel, 'trigger').attributes.triggeredEventSequences[0] - 1) }}"
+            maxPages: 5
+        dependsOn:
+          - step: assert-produced-events
+            condition: { type: succeeded }
+        weight: 0
+        allowFailure: false
+      - name: assert-stored-event
+        description: Confirm the reader saw an event produced by this command.
+        dependsOn:
+          - step: read-back
+            condition: { type: succeeded }
+        task:
+          type: assert
+          expr: >-
+            data.latest(inputs.eventsModel, "events").attributes.events.exists(e,
+              e.sequence in data.latest(inputs.commandModel, "trigger").attributes.triggeredEventSequences)
+          message: The event reader did not return an event produced by this command; check its type, scope and cursor.
+          severity: high
+        weight: 0
+        allowFailure: false
+    dependsOn: []
+    weight: 0
+version: 1

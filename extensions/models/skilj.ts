@@ -1,6 +1,6 @@
 /**
  * Swamp model for the REST surface of a running SkilJ deployment
- * (https://codeberg.org/gklijs/SkilJ): trigger or dry-run commands, read
+ * (https://github.com/gklijs/SkilJ): trigger or dry-run commands, read
  * events with a client-tracked cursor or a server-tracked consume cursor,
  * acknowledge consumed events, write external or direct events, and report
  * parked broker deliveries.
@@ -21,6 +21,17 @@ export const GlobalArgsSchema = z.object({
   ),
   token: z.string().min(3).meta({ sensitive: true }).describe(
     "SkilJ access token in '<id>.<secret>' form - store it in a vault",
+  ),
+  debug: z.boolean().optional().describe(
+    "Log request method, route, attempt, status and elapsed time; excludes headers, query values and bodies",
+  ),
+  traceparent: z.string().regex(
+    /^00-(?!0{32}-)[0-9a-f]{32}-(?!0{16}-)[0-9a-f]{16}-[0-9a-f]{2}$/,
+  ).optional().describe(
+    "W3C traceparent header to connect requests to an upstream distributed trace",
+  ),
+  tracestate: z.string().max(512).regex(/^[\x20-\x7e]*$/).optional().describe(
+    "Optional W3C tracestate header accompanying traceparent",
   ),
   timeoutMs: z.number().int().positive().default(10000).describe(
     "Per-request timeout in milliseconds",
@@ -82,6 +93,10 @@ export const FetchEventsArgsSchema = z.object({
   correlationId: z.string().optional().describe(
     "Only return events with this correlation id",
   ),
+  upToSequence: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)
+    .optional().describe(
+      "Read history as known at this sequence, inclusive (SkilJ 0.3.0)",
+    ),
   maxPages: z.number().int().positive().max(100).default(1).describe(
     "Follow nextCursor for up to this many pages",
   ),
@@ -99,7 +114,7 @@ export const ConsumeEventsArgsSchema = z.object({
 
 /** Arguments for `acknowledgeEvents`. */
 export const AcknowledgeEventsArgsSchema = z.object({
-  sequence: z.number().int().describe(
+  sequence: z.number().int().nonnegative().describe(
     "Advance a manual_ack cursor up to this served sequence",
   ),
   epoch: z.string().optional().describe(
@@ -164,10 +179,33 @@ export const ReportParkedDeliveryArgsSchema = z.object({
   ),
 });
 
+/** Arguments for ordered command batches; the server enforces its batch limit. */
+export const TriggerCommandsArgsSchema = z.object({
+  commands: z.array(TriggerCommandArgsSchema).min(1),
+  stopAtFirstFailure: z.boolean().default(false),
+});
+
+/** Arguments for ordered external-event batches. */
+export const IngestExternalEventsArgsSchema = z.object({
+  events: z.array(IngestExternalEventArgsSchema).min(1),
+  stopAtFirstFailure: z.boolean().default(true).describe(
+    "Stop after a failure to avoid advancing a source watermark past it",
+  ),
+});
+
+/** Discover tag values visible to the event-read token. */
+export const SearchUsedTagsArgsSchema = z.object({
+  key: z.string().min(1),
+  prefix: z.string().default(""),
+  limit: z.number().int().min(0).max(100).default(20),
+});
+
 const CommandResultSchema = z.object({
+  pendingApproval: z.boolean().default(false),
+  proposalId: z.string().nullable().default(null),
   dryRun: z.boolean().describe("True when nothing was stored"),
   accepted: z.boolean().describe("Whether decide() accepted the command"),
-  triggeredEventSequences: z.array(z.number()).describe(
+  triggeredEventSequences: z.array(z.number().int().nonnegative()).describe(
     "Sequences of the events the command stored (empty for dry runs)",
   ),
   rejectionReason: z.string().nullable(),
@@ -179,13 +217,16 @@ const CommandResultSchema = z.object({
 });
 
 const EventSchema = z.object({
-  sequence: z.number(),
+  sequence: z.number().int().nonnegative(),
   eventType: z.string(),
-  payload: z.unknown(),
+  payload: z.unknown().refine(
+    (value) => value !== undefined,
+    "Event payload is missing",
+  ),
   tags: z.array(z.object({ key: z.string(), value: z.string().nullable() })),
   metadata: z.object({
     type: z.string(),
-    version: z.number(),
+    version: z.number().int().nonnegative(),
     clientId: z.string(),
     createdAt: z.string(),
     correlationId: z.string().nullable(),
@@ -194,11 +235,18 @@ const EventSchema = z.object({
 });
 
 const EventTypeInfo = {
-  eventTypeName: z.string(),
-  eventTypeSchema: z.string(),
-  eventTypeSchemaVersion: z.number(),
-  epoch: z.string(),
+  eventTypeName: z.string().min(1),
+  eventTypeSchema: z.string().min(1),
+  eventTypeSchemaVersion: z.number().int().nonnegative(),
+  epoch: z.string().min(1),
 };
+
+const EventsResponseSchema = z.object({
+  ...EventTypeInfo,
+  events: z.array(z.record(z.string(), z.unknown())),
+  nextCursor: z.string().min(1).nullable(),
+});
+const ConsumeResponseSchema = EventsResponseSchema.omit({ nextCursor: true });
 
 const EventsSchema = z.object({
   ...EventTypeInfo,
@@ -222,13 +270,15 @@ const ConsumedEventsSchema = z.object({
 });
 
 const AckSchema = z.object({
-  sequence: z.number().describe("The sequence the cursor was advanced to"),
+  sequence: z.number().int().nonnegative().describe(
+    "The sequence the cursor was advanced to",
+  ),
   epoch: z.string().nullable().describe("Epoch the ack was recorded in"),
 });
 
 const EventWriteSchema = z.object({
   kind: z.enum(["external", "direct"]),
-  sequence: z.number().nullable().describe(
+  sequence: z.number().int().nonnegative().nullable().describe(
     "Sequence of the stored event; null for a watermark-dedupe redelivery",
   ),
   redelivered: z.boolean().describe(
@@ -243,6 +293,52 @@ const ParkedDeliverySchema = z.object({
   identifier: z.string(),
 });
 
+const BatchErrorSchema = z.object({
+  error: z.object({
+    status: z.number().int(),
+    code: z.string(),
+    message: z.string(),
+  }),
+});
+const CommandOutcomeSchema = CommandResultSchema.omit({ dryRun: true });
+const BatchCommandsSchema = z.object({
+  outcomes: z.array(z.union([BatchErrorSchema, CommandOutcomeSchema])),
+  count: z.number(),
+  accepted: z.number(),
+  rejected: z.number(),
+  pending: z.number(),
+  failed: z.number(),
+});
+const ExternalOutcomeSchema = EventWriteSchema.omit({ kind: true });
+const BatchEventsSchema = z.object({
+  outcomes: z.array(z.union([BatchErrorSchema, ExternalOutcomeSchema])),
+  count: z.number(),
+  stored: z.number(),
+  redelivered: z.number(),
+  failed: z.number(),
+});
+const TagsSchema = z.object({
+  truncated: z.boolean().nullable().describe(
+    "True when the requested limit was reached; null when completeness is unknown because the server supplies neither a total nor a continuation cursor",
+  ),
+  key: z.string(),
+  prefix: z.string(),
+  tags: z.array(z.object({ key: z.string(), value: z.string().nullable() })),
+  count: z.number(),
+});
+
+function commandResult(body: Record<string, unknown>, dryRun = false) {
+  return CommandResultSchema.parse({
+    ...body,
+    dryRun,
+    triggeredEventSequences: body.triggeredEventSequences ?? [],
+    rejectionReason: body.rejectionReason ?? null,
+    rejectionKind: body.rejectionKind ?? null,
+    correlationId: body.correlationId ?? null,
+    deduplicated: body.deduplicated ?? false,
+  });
+}
+
 /** Minimal logger shape used by the model. */
 interface Logger {
   info(msg: string, props?: Record<string, unknown>): void;
@@ -253,6 +349,8 @@ interface Logger {
 export interface SkiljContext {
   globalArgs: GlobalArgs;
   logger: Logger;
+  signal?: AbortSignal;
+  traceHeaders?: Readonly<Record<string, string>>;
   writeResource(
     specName: string,
     name: string,
@@ -294,21 +392,62 @@ function backoffMs(attempt: number): number {
   return Math.min(200 * 2 ** attempt, 2000);
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  signal?.throwIfAborted();
+  return new Promise((resolve, reject) => {
+    const abort = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+      reject(signal?.reason);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", abort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", abort, { once: true });
+  });
 }
 
-async function request(
-  globalArgs: GlobalArgs,
+function retryDelay(response: Response, attempt: number): number | null {
+  const header = response.headers.get("Retry-After");
+  if (header !== null) {
+    const value = header.trim();
+    const delay = /^\d+$/.test(value)
+      ? Number(value) * 1000
+      : Date.parse(value) - Date.now();
+    if (Number.isFinite(delay)) {
+      // Do not retry sooner than the server asks. Long waits are left to
+      // the caller rather than holding a Swamp method indefinitely.
+      return delay > 30000 ? null : Math.max(0, delay);
+    }
+  }
+  return backoffMs(attempt);
+}
+
+/** Perform an authenticated JSON request with retry and diagnostic controls. */
+export async function request(
+  context: SkiljContext,
   method: "GET" | "POST",
   path: string,
-  options: { body?: unknown; idempotencyKey?: string; retry?: boolean } = {},
+  options: {
+    body?: unknown;
+    idempotencyKey?: string;
+    retry?: boolean;
+    sensitiveResponse?: boolean;
+  } = {},
 ): Promise<Record<string, unknown>> {
+  const globalArgs = context.globalArgs;
   const url = new URL(path, globalArgs.baseUrl.replace(/\/?$/, "/"));
   const headers: Record<string, string> = {
     "Authorization": `Bearer ${globalArgs.token}`,
     "Accept": "application/json",
   };
+  const traceparent = globalArgs.traceparent ??
+    context.traceHeaders?.traceparent;
+  const tracestate = globalArgs.tracestate ??
+    (globalArgs.traceparent ? undefined : context.traceHeaders?.tracestate);
+  if (traceparent) headers.traceparent = traceparent;
+  if (tracestate) headers.tracestate = tracestate;
   if (options.body !== undefined) headers["Content-Type"] = "application/json";
   if (options.idempotencyKey) {
     headers["Idempotency-Key"] = options.idempotencyKey;
@@ -319,19 +458,44 @@ async function request(
     ? 1 + Math.min(Math.max(globalArgs.maxRetries ?? 0, 0), 10)
     : 1;
   for (let attempt = 0;; attempt++) {
+    context.signal?.throwIfAborted();
+    const started = performance.now();
+    const diagnostic = (status: number | null) => {
+      if (globalArgs.debug) {
+        context.logger.info("SkilJ HTTP request", {
+          route,
+          attempt: attempt + 1,
+          status,
+          elapsedMs: Math.round(performance.now() - started),
+        });
+      }
+    };
     let response: Response;
+    let text: string;
+    let status: number | null = null;
     try {
       response = await fetch(url, {
         method,
         headers,
+        // Redirecting a POST can forward its private body to another host.
+        redirect: "manual",
         body: options.body === undefined
           ? undefined
           : JSON.stringify(options.body),
-        signal: AbortSignal.timeout(globalArgs.timeoutMs),
+        signal: context.signal
+          ? AbortSignal.any([
+            context.signal,
+            AbortSignal.timeout(globalArgs.timeoutMs),
+          ])
+          : AbortSignal.timeout(globalArgs.timeoutMs),
       });
+      status = response.status;
+      text = await response.text();
     } catch (err) {
+      diagnostic(status);
+      context.signal?.throwIfAborted();
       if (attempt + 1 < maxAttempts) {
-        await sleep(backoffMs(attempt));
+        await sleep(backoffMs(attempt), context.signal);
         continue;
       }
       const reason = err instanceof DOMException && err.name === "TimeoutError"
@@ -341,7 +505,7 @@ async function request(
         cause: err,
       });
     }
-    const text = await response.text();
+    diagnostic(response.status);
     let json: unknown = null;
     try {
       json = text ? JSON.parse(text) : null;
@@ -350,27 +514,41 @@ async function request(
     }
     if (!response.ok) {
       if (attempt + 1 < maxAttempts && isRetryableStatus(response.status)) {
-        await sleep(backoffMs(attempt));
-        continue;
+        const delay = retryDelay(response, attempt);
+        if (delay !== null) {
+          await sleep(delay, context.signal);
+          continue;
+        }
       }
-      const body = json as { code?: string; message?: string } | null;
+      const body =
+        json !== null && typeof json === "object" && !Array.isArray(json)
+          ? json as Record<string, unknown>
+          : {};
+      const code = typeof body.code === "string" ? body.code : null;
+      const detail = typeof body.message === "string"
+        ? body.message
+        : (text.slice(0, 500) || response.statusText);
       throw new SkiljApiError(
         route,
         response.status,
-        body?.code ?? null,
-        body?.message ?? (text.slice(0, 500) || response.statusText),
+        options.sensitiveResponse ? null : code,
+        options.sensitiveResponse
+          ? "response body withheld because it may contain sensitive data"
+          : detail,
       );
     }
     if (json === null || typeof json !== "object" || Array.isArray(json)) {
       if (attempt + 1 < maxAttempts) {
-        await sleep(backoffMs(attempt));
+        await sleep(backoffMs(attempt), context.signal);
         continue;
       }
       throw new SkiljApiError(
         route,
         response.status,
         null,
-        `expected a JSON object, got: ${text.slice(0, 200)}`,
+        options.sensitiveResponse
+          ? "expected a JSON object; response body withheld"
+          : `expected a JSON object, got: ${text.slice(0, 200)}`,
       );
     }
     return json as Record<string, unknown>;
@@ -385,6 +563,9 @@ function eventsPath(
   for (const filter of args.filters) params.append("filter", filter);
   if (after) params.set("after", after);
   if (args.epoch && after === args.after) params.set("epoch", args.epoch);
+  if (args.upToSequence !== undefined) {
+    params.set("upToSequence", String(args.upToSequence));
+  }
   if (args.correlationId) params.set("correlationId", args.correlationId);
   const query = params.toString();
   return query ? `v1/events?${query}` : "v1/events";
@@ -416,30 +597,42 @@ function toEvent(raw: Record<string, unknown>): z.infer<typeof EventSchema> {
   });
 }
 
-function toEventTypeInfo(
-  body: Record<string, unknown>,
-  epoch: string,
-): z.infer<typeof EventsSchema>["eventTypeName"] extends never ? never : {
-  eventTypeName: string;
-  eventTypeSchema: string;
-  eventTypeSchemaVersion: number;
-  epoch: string;
-} {
-  return {
-    eventTypeName: String(body.eventTypeName ?? ""),
-    eventTypeSchema: String(body.eventTypeSchema ?? ""),
-    eventTypeSchemaVersion: Number(body.eventTypeSchemaVersion ?? 0),
-    epoch,
-  };
+function toEventTypeInfo(body: Record<string, unknown>) {
+  return z.object(EventTypeInfo).parse(body);
 }
 
 /** The `@gklijs/skilj` model definition. */
 export const model = {
   type: "@gklijs/skilj",
-  version: "2026.10.14.2",
+  version: "2026.11.07.1",
   globalArguments: GlobalArgsSchema,
+  upgrades: [{
+    toVersion: "2026.11.07.1",
+    description:
+      "SkilJ 0.3.0 features; existing connection arguments remain compatible",
+    upgradeAttributes: (old: Record<string, unknown>) => old,
+  }],
 
   resources: {
+    batchCommands: {
+      description:
+        "Ordered command outcomes, including per-item errors and pending approvals",
+      schema: BatchCommandsSchema,
+      lifetime: "30d" as const,
+      garbageCollection: 20,
+    },
+    batchEvents: {
+      description: "Ordered external-event outcomes, including per-item errors",
+      schema: BatchEventsSchema,
+      lifetime: "30d" as const,
+      garbageCollection: 20,
+    },
+    usedTags: {
+      description: "Distinct used tag values visible to the event-read token",
+      schema: TagsSchema,
+      lifetime: "30d" as const,
+      garbageCollection: 20,
+    },
     commandResult: {
       description: "Outcome of a triggered or dry-run command",
       schema: CommandResultSchema,
@@ -480,6 +673,147 @@ export const model = {
   },
 
   methods: {
+    triggerCommands: {
+      description:
+        "Trigger ordered commands (POST /v1/commands/trigger/batch); per-item failures are recorded, not thrown. Not atomic",
+      arguments: TriggerCommandsArgsSchema,
+      execute: async (
+        args: z.infer<typeof TriggerCommandsArgsSchema>,
+        context: SkiljContext,
+      ) => {
+        context.logger.info("Triggering SkilJ command batch ({count} items)", {
+          count: args.commands.length,
+        });
+        const body = await request(
+          context,
+          "POST",
+          "v1/commands/trigger/batch",
+          {
+            body: args,
+            // Each command needs its own key; a request-level key is ignored.
+            retry: args.commands.every((item) =>
+              item.idempotencyKey !== undefined
+            ),
+          },
+        );
+        const raw = z.array(z.record(z.string(), z.unknown())).length(
+          args.commands.length,
+        ).parse(body.outcomes);
+        const outcomes = raw.map((item) =>
+          "error" in item
+            ? BatchErrorSchema.parse(item)
+            : CommandOutcomeSchema.parse(commandResult(item))
+        );
+        const done = outcomes.filter((
+          item,
+        ): item is Exclude<typeof item, { error: unknown }> =>
+          !("error" in item)
+        );
+        const result = BatchCommandsSchema.parse({
+          outcomes,
+          count: outcomes.length,
+          accepted: done.filter((item) =>
+            item.accepted && !item.pendingApproval
+          ).length,
+          rejected: done.filter((item) =>
+            !item.accepted && !item.pendingApproval
+          ).length,
+          pending: done.filter((item) => item.pendingApproval).length,
+          failed: outcomes.length - done.length,
+        });
+        context.logger.info(
+          "Command batch completed ({count} outcomes, {failed} errors)",
+          { count: result.count, failed: result.failed },
+        );
+        return {
+          dataHandles: [
+            await context.writeResource("batchCommands", "commands", result),
+          ],
+        };
+      },
+    },
+    ingestExternalEvents: {
+      description:
+        "Ingest ordered external events (POST /v1/events/external/batch); per-item failures are recorded. Not atomic",
+      arguments: IngestExternalEventsArgsSchema,
+      execute: async (
+        args: z.infer<typeof IngestExternalEventsArgsSchema>,
+        context: SkiljContext,
+      ) => {
+        context.logger.info("Ingesting SkilJ event batch ({count} items)", {
+          count: args.events.length,
+        });
+        const body = await request(
+          context,
+          "POST",
+          "v1/events/external/batch",
+          {
+            body: args,
+            retry: args.events.every((item) =>
+              item.idempotencyKey !== undefined || item.dedupe !== undefined
+            ),
+          },
+        );
+        const outcomes = z.array(
+          z.union([BatchErrorSchema, ExternalOutcomeSchema]),
+        ).length(args.events.length).parse(body.outcomes);
+        const done = outcomes.filter((
+          item,
+        ): item is Exclude<typeof item, { error: unknown }> =>
+          !("error" in item)
+        );
+        const result = BatchEventsSchema.parse({
+          outcomes,
+          count: outcomes.length,
+          stored: done.filter((item) => !item.redelivered).length,
+          redelivered: done.filter((item) => item.redelivered).length,
+          failed: outcomes.length - done.length,
+        });
+        context.logger.info(
+          "Event batch completed ({count} outcomes, {failed} errors)",
+          { count: result.count, failed: result.failed },
+        );
+        return {
+          dataHandles: [
+            await context.writeResource("batchEvents", "externalBatch", result),
+          ],
+        };
+      },
+    },
+    searchUsedTags: {
+      description:
+        "Discover distinct tag values by literal prefix (GET /v1/events/tags) within the token's event type and owner scope",
+      arguments: SearchUsedTagsArgsSchema,
+      execute: async (
+        args: z.infer<typeof SearchUsedTagsArgsSchema>,
+        context: SkiljContext,
+      ) => {
+        context.logger.info("Searching visible SkilJ tag values");
+        const params = new URLSearchParams({
+          key: args.key,
+          prefix: args.prefix,
+          limit: String(args.limit),
+        });
+        const body = await request(context, "GET", `v1/events/tags?${params}`, {
+          retry: true,
+        });
+        const tags = TagsSchema.shape.tags.parse(body.tags);
+        const result = TagsSchema.parse({
+          ...args,
+          tags,
+          count: tags.length,
+          truncated: tags.length >= args.limit ? true : null,
+        });
+        context.logger.info("Found {count} visible tag values", {
+          count: result.count,
+        });
+        return {
+          dataHandles: [
+            await context.writeResource("usedTags", "tags", result),
+          ],
+        };
+      },
+    },
     triggerCommand: {
       description:
         "Trigger the token's command type (POST /v1/commands/trigger). A business rejection is recorded, not thrown",
@@ -490,7 +824,7 @@ export const model = {
       ): Promise<{ dataHandles: { name: string }[] }> => {
         context.logger.info("Triggering SkilJ command");
         const body = await request(
-          context.globalArgs,
+          context,
           "POST",
           "v1/commands/trigger",
           {
@@ -505,16 +839,12 @@ export const model = {
             retry: args.idempotencyKey !== undefined,
           },
         );
-        const result = CommandResultSchema.parse({
-          dryRun: false,
-          accepted: body.accepted,
-          triggeredEventSequences: body.triggeredEventSequences ?? [],
-          rejectionReason: body.rejectionReason ?? null,
-          rejectionKind: body.rejectionKind ?? null,
-          deduplicated: body.deduplicated ?? false,
-          correlationId: body.correlationId ?? null,
-        });
-        if (result.accepted) {
+        const result = commandResult(body);
+        if (result.pendingApproval) {
+          context.logger.info("Command awaiting approval: {proposalId}", {
+            proposalId: result.proposalId,
+          });
+        } else if (result.accepted) {
           context.logger.info("Command accepted, stored {count} event(s)", {
             count: result.triggeredEventSequences.length,
           });
@@ -543,7 +873,7 @@ export const model = {
       ): Promise<{ dataHandles: { name: string }[] }> => {
         context.logger.info("Dry-running SkilJ command");
         const body = await request(
-          context.globalArgs,
+          context,
           "POST",
           "v1/commands/dry-run",
           {
@@ -552,15 +882,7 @@ export const model = {
             retry: true,
           },
         );
-        const result = CommandResultSchema.parse({
-          dryRun: true,
-          accepted: body.accepted,
-          triggeredEventSequences: [],
-          rejectionReason: body.rejectionReason ?? null,
-          rejectionKind: body.rejectionKind ?? null,
-          deduplicated: false,
-          correlationId: null,
-        });
+        const result = commandResult(body, true);
         context.logger.info("Dry run {outcome}", {
           outcome: result.accepted
             ? "accepted"
@@ -588,21 +910,25 @@ export const model = {
         });
         const events: z.infer<typeof EventSchema>[] = [];
         let cursor = args.after;
-        let first: Record<string, unknown> | null = null;
+        let first: z.infer<typeof EventsResponseSchema> | null = null;
+        const visited = new Set(args.after ? [args.after] : []);
+        const initialPosition = /^(-?\d+)(?:@.+)?$/.exec(args.after ?? "");
+        let lastSequence = initialPosition ? BigInt(initialPosition[1]) : -1n;
         let epoch = "";
         let pages = 0;
-        let lastPageEmpty = false;
+        let hasMore = false;
         while (pages < args.maxPages) {
           const body = await request(
-            context.globalArgs,
+            context,
             "GET",
             eventsPath(args, cursor),
             // A read: always safe to retry.
             { retry: true },
           );
-          first ??= body;
+          const response = EventsResponseSchema.parse(body);
+          first ??= response;
           pages++;
-          const pageEpoch = typeof body.epoch === "string" ? body.epoch : "";
+          const pageEpoch = response.epoch;
           if (epoch && pageEpoch && pageEpoch !== epoch) {
             throw new SkiljApiError(
               "GET /v1/events",
@@ -613,23 +939,44 @@ export const model = {
             );
           }
           if (pageEpoch) epoch = pageEpoch;
-          const page = Array.isArray(body.events) ? body.events : [];
-          events.push(
-            ...page.map((e) => toEvent(e as Record<string, unknown>)),
-          );
-          const next = typeof body.nextCursor === "string"
-            ? body.nextCursor
-            : null;
-          lastPageEmpty = page.length === 0;
-          if (next !== null) cursor = next;
-          if (lastPageEmpty || next === null) break;
+          const page = response.events.map(toEvent);
+          for (const event of page) {
+            if (event.sequence <= lastSequence) {
+              throw new Error(
+                "SkilJ GET /v1/events returned duplicate or unordered event sequences",
+              );
+            }
+            lastSequence = BigInt(event.sequence);
+          }
+          events.push(...page);
+          const next = response.nextCursor;
+          if (next !== null) {
+            const position = /^(-?\d+)@(.+)$/.exec(next);
+            if (
+              !position || position[2] !== response.epoch ||
+              BigInt(position[1]) < lastSequence
+            ) {
+              throw new Error(
+                "SkilJ GET /v1/events returned an invalid, regressing or wrong-epoch cursor",
+              );
+            }
+          }
+          hasMore = page.length > 0 && next !== null;
+          if (hasMore && visited.has(next!)) {
+            throw new Error(
+              "SkilJ GET /v1/events returned a non-advancing cursor (repeated or cyclic)",
+            );
+          }
+          if (next !== null) visited.add(next);
+          cursor = next ?? undefined;
+          if (!hasMore) break;
         }
         const result = EventsSchema.parse({
-          ...toEventTypeInfo(first ?? {}, epoch),
+          ...toEventTypeInfo(first ?? {}),
           events,
           nextCursor: cursor ?? null,
           pages,
-          truncated: pages >= args.maxPages && !lastPageEmpty,
+          truncated: pages >= args.maxPages && hasMore,
         });
         context.logger.info("Fetched {count} event(s) in {pages} page(s)", {
           count: events.length,
@@ -652,17 +999,26 @@ export const model = {
           mode: args.mode ?? "cursor's own",
         });
         const body = await request(
-          context.globalArgs,
+          context,
           "GET",
           consumePath(args),
-          // A read: always safe to retry.
-          { retry: true },
+          // This GET advances the cursor or acquires a claim. A lost response
+          // must not silently skip an auto batch or replace a manual claim.
+          { retry: false },
         );
-        const served = Array.isArray(body.events) ? body.events : [];
+        const response = ConsumeResponseSchema.parse(body);
+        const served = response.events.map(toEvent);
+        for (let index = 1; index < served.length; index++) {
+          if (served[index].sequence <= served[index - 1].sequence) {
+            throw new Error(
+              "SkilJ GET /v1/events/consume returned duplicate or unordered event sequences",
+            );
+          }
+        }
         const result = ConsumedEventsSchema.parse({
-          ...toEventTypeInfo(body, String(body.epoch ?? "")),
+          ...toEventTypeInfo(response),
           mode: args.mode ?? null,
-          events: served.map((e) => toEvent(e as Record<string, unknown>)),
+          events: served,
           count: served.length,
         });
         context.logger.info("Consumed {count} event(s)", {
@@ -689,7 +1045,7 @@ export const model = {
           sequence: args.sequence,
         });
         await request(
-          context.globalArgs,
+          context,
           "POST",
           "v1/events/consume/ack",
           {
@@ -718,7 +1074,7 @@ export const model = {
       ): Promise<{ dataHandles: { name: string }[] }> => {
         context.logger.info("Ingesting external SkilJ event");
         const body = await request(
-          context.globalArgs,
+          context,
           "POST",
           "v1/events/external",
           {
@@ -739,8 +1095,7 @@ export const model = {
         );
         const result = EventWriteSchema.parse({
           kind: "external",
-          sequence: body.sequence ?? null,
-          redelivered: body.redelivered ?? false,
+          ...ExternalOutcomeSchema.parse(body),
         });
         context.logger.info("External event {outcome}", {
           outcome: result.redelivered
@@ -766,7 +1121,7 @@ export const model = {
       ): Promise<{ dataHandles: { name: string }[] }> => {
         context.logger.info("Creating direct SkilJ event");
         const body = await request(
-          context.globalArgs,
+          context,
           "POST",
           "v1/events/direct",
           {
@@ -818,7 +1173,7 @@ export const model = {
           source: args.source,
         });
         const body = await request(
-          context.globalArgs,
+          context,
           "POST",
           "v1/parked-deliveries",
           {

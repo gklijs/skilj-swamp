@@ -51,7 +51,7 @@ jobs:
         task:
           type: assert
           expr: >-
-            data.latest(inputs.commandModel, "commandResult").attributes.accepted
+            data.latest(inputs.commandModel, "dryRun").attributes.accepted
           message: >-
             Dry run rejected the withdrawal - inspect the commandResult rejectionReason before triggering.
           severity: high
@@ -74,16 +74,29 @@ jobs:
         weight: 0
         allowFailure: false
       - name: assert-accepted
-        description: Stop when decide() rejected the trigger.
+        description: Stop when the command was rejected or awaits approval.
         dependsOn:
           - step: trigger
             condition: { type: succeeded }
         task:
           type: assert
           expr: >-
-            data.latest(inputs.commandModel, "commandResult").attributes.accepted
+            data.latest(inputs.commandModel, "trigger").attributes.accepted
           message: >-
-            ${{ data.latest(inputs.commandModel, "commandResult").attributes.rejectionReason }}
+            Command did not store events; inspect commandResult for rejection or pending approval.
+          severity: high
+        weight: 0
+        allowFailure: false
+      - name: assert-produced-events
+        description: A withdrawal must produce at least one stored event.
+        dependsOn:
+          - step: assert-accepted
+            condition: { type: succeeded }
+        task:
+          type: assert
+          expr: >-
+            size(data.latest(inputs.commandModel, "trigger").attributes.triggeredEventSequences) > 0
+          message: Withdrawal was accepted but did not produce an event.
           severity: high
         weight: 0
         allowFailure: false
@@ -95,10 +108,25 @@ jobs:
           methodName: fetchEvents
           inputs:
             filters: []
-            maxPages: 1
+            after: "${{ string(data.latest(inputs.commandModel, 'trigger').attributes.triggeredEventSequences[0] - 1) }}"
+            maxPages: 5
         dependsOn:
-          - step: assert-accepted
+          - step: assert-produced-events
             condition: { type: succeeded }
+        weight: 0
+        allowFailure: false
+      - name: assert-stored-event
+        description: Confirm the reader saw an event produced by this command.
+        dependsOn:
+          - step: read-back
+            condition: { type: succeeded }
+        task:
+          type: assert
+          expr: >-
+            data.latest(inputs.eventsModel, "events").attributes.events.exists(e,
+              e.sequence in data.latest(inputs.commandModel, "trigger").attributes.triggeredEventSequences)
+          message: The event reader did not return an event produced by this withdrawal; check its type, scope and cursor.
+          severity: high
         weight: 0
         allowFailure: false
     dependsOn: []

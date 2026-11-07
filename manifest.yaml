@@ -1,15 +1,22 @@
 manifestVersion: 1
 name: "@gklijs/skilj"
-version: "2026.10.14.2"
-description: "Trigger and dry-run commands, read or consume events, acknowledge consume cursors, ingest external events, store direct events and report parked deliveries on a SkilJ (event-sourced, DCB) server over its REST API."
+version: "2026.11.07.1"
+description: "SkilJ 0.3.0 REST and GraphQL: token lifecycle management, offline operation validation, frontend JSON/SDL schema export, command debugging, commands and explicit proposal decisions, schema compatibility checks, ordered batches, historical event reads, tag discovery, tracing, and skills for vault-backed setup, workflows, frontends and debugging."
 repository: "https://github.com/gklijs/skilj-swamp"
 license: MIT
 models:
   - skilj.ts
+  - skilj_graphql.ts
 workflows:
   - workflow-withdraw-and-verify.yaml
+  - workflow-skilj-command-and-verify.yaml
 reports:
   - skilj_report.ts
+skills:
+  - skilj-setup
+  - skilj-workflows
+  - skilj-debug
+  - skilj-frontend
 additionalFiles:
   - README.md
   - LICENSE
