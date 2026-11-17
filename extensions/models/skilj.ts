@@ -12,6 +12,7 @@
  *
  * @module
  */
+import { type Diagnostic, diagnosticMessage } from "../lib/diagnostics.ts";
 import { z } from "npm:zod@4";
 
 /** Global arguments shared by every method of the model. */
@@ -370,13 +371,19 @@ export class SkiljApiError extends Error {
     route: string,
     status: number,
     code: string | null,
-    detail: string,
+    _detail: string,
+    diagnostic?: Diagnostic,
   ) {
-    super(
-      `SkilJ ${route} failed with HTTP ${status}${
-        code ? ` (${code})` : ""
-      }: ${detail}`,
-    );
+    super(diagnosticMessage(
+      diagnostic ?? {
+        surface: "rest",
+        status,
+        code,
+        transport: null,
+        effect: route.startsWith("GET ") ? "read" : "write",
+        protected: false,
+      },
+    ));
     this.name = "SkiljApiError";
     this.status = status;
     this.code = code;
@@ -434,6 +441,7 @@ export async function request(
     idempotencyKey?: string;
     retry?: boolean;
     sensitiveResponse?: boolean;
+    effect?: Diagnostic["effect"];
   } = {},
 ): Promise<Record<string, unknown>> {
   const globalArgs = context.globalArgs;
@@ -454,6 +462,23 @@ export async function request(
   }
 
   const route = `${method} ${url.pathname}`;
+  const diagnosticMetadata = (
+    status: number | null,
+    code: string | null,
+    transport: Diagnostic["transport"] = null,
+  ): Diagnostic => ({
+    surface: options.sensitiveResponse ? "graphql" : "rest",
+    status,
+    code,
+    transport,
+    effect: options.effect ??
+      (path.startsWith("v1/events/consume")
+        ? "consume"
+        : method === "GET" || path === "v1/commands/dry-run"
+        ? "read"
+        : "write"),
+    protected: options.retry === true,
+  });
   const maxAttempts = options.retry
     ? 1 + Math.min(Math.max(globalArgs.maxRetries ?? 0, 0), 10)
     : 1;
@@ -498,12 +523,17 @@ export async function request(
         await sleep(backoffMs(attempt), context.signal);
         continue;
       }
-      const reason = err instanceof DOMException && err.name === "TimeoutError"
-        ? `timed out after ${globalArgs.timeoutMs}ms`
-        : String(err);
-      throw new Error(`SkilJ ${route} could not be reached: ${reason}`, {
-        cause: err,
-      });
+      throw new Error(
+        diagnosticMessage(
+          diagnosticMetadata(
+            status,
+            null,
+            err instanceof DOMException && err.name === "TimeoutError"
+              ? "timeout"
+              : "unavailable",
+          ),
+        ),
+      );
     }
     diagnostic(response.status);
     let json: unknown = null;
@@ -525,16 +555,15 @@ export async function request(
           ? json as Record<string, unknown>
           : {};
       const code = typeof body.code === "string" ? body.code : null;
-      const detail = typeof body.message === "string"
-        ? body.message
-        : (text.slice(0, 500) || response.statusText);
       throw new SkiljApiError(
         route,
         response.status,
         options.sensitiveResponse ? null : code,
-        options.sensitiveResponse
-          ? "response body withheld because it may contain sensitive data"
-          : detail,
+        "",
+        diagnosticMetadata(
+          response.status,
+          options.sensitiveResponse ? null : code,
+        ),
       );
     }
     if (json === null || typeof json !== "object" || Array.isArray(json)) {
@@ -546,9 +575,8 @@ export async function request(
         route,
         response.status,
         null,
-        options.sensitiveResponse
-          ? "expected a JSON object; response body withheld"
-          : `expected a JSON object, got: ${text.slice(0, 200)}`,
+        "",
+        diagnosticMetadata(response.status, null),
       );
     }
     return json as Record<string, unknown>;
@@ -604,6 +632,7 @@ function toEventTypeInfo(body: Record<string, unknown>) {
 /** The `@gklijs/skilj` model definition. */
 export const model = {
   type: "@gklijs/skilj",
+  reports: ["@gklijs/skilj-report"],
   version: "2026.11.07.1",
   globalArguments: GlobalArgsSchema,
   upgrades: [{
@@ -849,10 +878,9 @@ export const model = {
             count: result.triggeredEventSequences.length,
           });
         } else {
-          context.logger.warning("Command rejected ({kind}): {reason}", {
-            kind: result.rejectionKind,
-            reason: result.rejectionReason,
-          });
+          context.logger.warning(
+            "Command rejected by domain rules; inspect the result resource",
+          );
         }
         const handle = await context.writeResource(
           "commandResult",
@@ -884,9 +912,7 @@ export const model = {
         );
         const result = commandResult(body, true);
         context.logger.info("Dry run {outcome}", {
-          outcome: result.accepted
-            ? "accepted"
-            : `rejected (${result.rejectionKind})`,
+          outcome: result.accepted ? "accepted" : "rejected by domain rules",
         });
         const handle = await context.writeResource(
           "commandResult",

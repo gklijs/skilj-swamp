@@ -13,13 +13,50 @@ first; confirm retrieval syntax with `swamp help report get`. Distinguish
 transport failure, authorization error, command rejection and pending approval.
 An HTTP 200 can contain a business rejection or GraphQL errors.
 
+## Safe failure guidance
+
+Read the report's diagnostic category, sanitized status/code, next step and
+write/cursor uncertainty before choosing another operation. Diagnostics classify
+only known 0.4.0 codes and standard transport statuses. Unknown failures stay
+`unknown`; never infer authentication validity or expiry from decoded JWT
+claims. Use the
+[troubleshooting table](https://github.com/gklijs/skilj-swamp#troubleshooting)
+and its tagged server-source links for the exact contract.
+
+- `wrong_capability`: select the required capability kind and scope.
+- `reads_disabled`: have the deployment operator review `eventReadAllowed`;
+  minting another read capability does not enable reads.
+- `authentication` / `authorization`: check the vault credential, trusted IdP,
+  active Role/token and grant/scope with the authorized administrator.
+- `epoch_changed`: reconcile checkpoint and epoch before reading/consuming or
+  acknowledging again. Never blindly replace an old checkpoint.
+- `rate_limit`, `timeout`, `unavailable`: check authorized telemetry and honor
+  Retry-After and the method's existing retry policy.
+
+An uncertain write may already have taken effect. Reconcile first. Retain the
+original payload and idempotency key or dedupe identity for any authorized
+retry; never generate a new key to retry an old operation. Reconcile an
+unprotected write before replay. A lost consume response may advance the cursor
+or acquire a claim; inspect served events and checkpoint state before another
+consume. GraphQL mutations may partially take effect despite errors; no GraphQL
+method retries automatically. Do not run diagnostic probes that trigger commands
+or advance consume cursors.
+
+Failures before a normal artifact exists use a closed safe metadata envelope in
+Swamp's supported report `errorMessage` context. GraphQL `execute` and
+`debugCommand` also expose sanitized `diagnostics[]` alongside protected raw
+`data`/`errors`. Built-in methods still throw on GraphQL errors. Reports never
+echo arbitrary error text, GraphQL extensions, batch messages or private
+rejection reasons. Inspect the existing data pointers only when authorized.
+
 ## REST diagnostics
 
 Set the model's `debug: true`, then run with Swamp's `--log --show-properties`
 options. HTTP diagnostics contain method, route, attempt, status and elapsed
 milliseconds, excluding headers, query values and request/response bodies. A
-null status means the request failed before response headers arrived. Existing
-business-outcome logs and server error messages may still contain domain values.
+null status means the request failed before response headers arrived. Rejection
+logs and failure summaries omit private reasons and response bodies; use the
+result data pointers for deeper authorized inspection.
 
 Requests inherit Swamp's W3C trace context automatically. To override it,
 provide a valid `traceparent` and optional `tracestate` in global arguments. An

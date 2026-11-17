@@ -71,7 +71,7 @@ Deno.test("dryRunCommand rejection is a dry run, not a failure", async () => {
   });
   const out = await report.execute(ctx);
   assertStringIncludes(out.markdown, "Dry run (nothing stored)");
-  assertStringIncludes(out.markdown, "insufficient_funds");
+  assertStringIncludes(out.markdown, "Rejected by domain rules");
 });
 
 Deno.test("fetchEvents lists the served events and truncation", async () => {

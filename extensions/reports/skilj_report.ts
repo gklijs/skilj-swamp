@@ -7,6 +7,13 @@
  * @module
  */
 
+import {
+  type Diagnostic,
+  diagnosticFromMessage,
+  DiagnosticSchema,
+  explainDiagnostic,
+} from "../lib/diagnostics.ts";
+
 /** A resource data artifact produced during method execution. */
 interface DataHandle {
   name: string;
@@ -22,6 +29,7 @@ interface MethodReportContext {
   methodName: string;
   methodArgs: Record<string, unknown>;
   executionStatus: string;
+  errorMessage?: string;
   dataHandles: DataHandle[];
   dataRepository: {
     getContent: (
@@ -93,9 +101,7 @@ function commandSummary(data: Rec): string[] {
     return [`Accepted${dedup}; stored event(s): ${seqs || "—"}.`];
   }
   return [
-    `Rejected (${String(data.rejectionKind ?? "unknown")}): ${
-      String(data.rejectionReason ?? "no reason given")
-    }.`,
+    "Rejected by domain rules; inspect the authorized result for private rejection details. Review the business preconditions before another write.",
   ];
 }
 
@@ -186,8 +192,7 @@ export const report = {
       lines.push(
         context.executionStatus === "succeeded"
           ? `No data artifact to summarise.`
-          : `The method did not succeed, so there is nothing to summarise - ` +
-            `see @swamp/method-summary for the failure detail.`,
+          : `The method did not succeed; see @swamp/method-summary for execution details.`,
       );
     } else if (context.methodName === "triggerCommand") {
       lines.push(...commandSummary({ ...data, dryRun: false }));
@@ -312,9 +317,25 @@ export const report = {
         lines.push(
           `- Item ${index + 1}: ` +
             (error
-              ? `HTTP ${String(error.status)} (${String(error.code)}): ${
-                fmtValue(error.message)
-              }`
+              ? (() => {
+                const diagnostic = explainDiagnostic({
+                  surface: "rest",
+                  status: typeof error.status === "number"
+                    ? error.status
+                    : null,
+                  code: typeof error.code === "string" ? error.code : null,
+                  transport: null,
+                  effect: "write",
+                  protected: false,
+                });
+                return `${diagnostic.category} (HTTP ${
+                  diagnostic.status ?? "unknown"
+                }, code ${
+                  diagnostic.code ?? "unknown"
+                }): ${diagnostic.explanation} ${diagnostic.nextStep} Outcome uncertain: ${
+                  diagnostic.outcomeUncertain ? "yes" : "no"
+                }. [Troubleshooting](${diagnostic.documentation})`;
+              })()
               : context.methodName === "triggerCommands"
               ? commandSummary(outcome)[0]
               : eventWriteSummary(outcome)[0]),
@@ -339,6 +360,82 @@ export const report = {
     } else {
       lines.push(`Recorded ${fmtValue(data)}.`);
     }
+    const diagnostics: ReturnType<typeof explainDiagnostic>[] = [];
+    const addDiagnostic = (d: Diagnostic) => {
+      const explanation = explainDiagnostic(d);
+      if (
+        !diagnostics.some((item) =>
+          JSON.stringify(item) === JSON.stringify(explanation)
+        )
+      ) diagnostics.push(explanation);
+    };
+    if (context.executionStatus !== "succeeded") {
+      addDiagnostic(
+        diagnosticFromMessage(context.errorMessage) ?? {
+          surface: context.modelType === "@gklijs/skilj-graphql"
+            ? "graphql"
+            : "rest",
+          status: null,
+          code: null,
+          transport: null,
+          effect: context.methodName === "consumeEvents" ? "consume" : [
+              "fetchEvents",
+              "dryRunCommand",
+              "searchUsedTags",
+              "debugCommand",
+              "introspect",
+              "exportSchema",
+              "exportSchemaSdl",
+              "compareSchema",
+              "validateOperation",
+              "listCommandProposals",
+            ].includes(context.methodName)
+            ? "read"
+            : "write",
+          protected: false,
+        },
+      );
+    } else if (data && Array.isArray(data.diagnostics)) {
+      for (const raw of data.diagnostics) {
+        const parsed = DiagnosticSchema.safeParse(raw);
+        if (parsed.success) addDiagnostic(parsed.data);
+      }
+    }
+    if (data?.succeeded === false && diagnostics.length === 0) {
+      addDiagnostic({
+        surface: "graphql",
+        status: 200,
+        code: null,
+        transport: null,
+        effect: context.methodName === "debugCommand" ? "read" : "write",
+        protected: false,
+      });
+    }
+    for (const d of diagnostics) {
+      lines.push(
+        "",
+        `**Diagnosis**: ${d.category} (HTTP ${d.status ?? "unknown"}, code ${
+          d.code ?? "unknown"
+        }). ${d.explanation}`,
+        `**Next step**: ${d.nextStep}`,
+        `**Write/cursor outcome uncertain**: ${
+          d.outcomeUncertain ? "yes" : "no"
+        }.`,
+        `[Troubleshooting](${d.documentation})`,
+      );
+    }
+    if (
+      data &&
+      (data.accepted === false ||
+        (data.commandSummary as Rec | undefined)?.accepted === false ||
+        (typeof data.failed === "number" && data.failed > 0))
+    ) {
+      lines.push(
+        "",
+        "Review the recorded outcomes and business preconditions before another operation.",
+        "[Troubleshooting](https://github.com/gklijs/skilj-swamp#troubleshooting)",
+      );
+    }
     const handles = context.dataHandles.filter((h) => h.specName);
     if (handles.length) {
       lines.push(``, `## Data`, ``);
@@ -356,6 +453,7 @@ export const report = {
       json: {
         method: context.methodName,
         status: context.executionStatus,
+        diagnostics,
         artifacts: handles.map((h) => ({ spec: h.specName, name: h.name })),
       },
     };

@@ -4,6 +4,11 @@
  * active SkilJ Role, separate from REST capability tokens.
  * @module
  */
+import {
+  diagnosticMessage,
+  DiagnosticSchema,
+  sanitizeDiagnostic,
+} from "../lib/diagnostics.ts";
 import { z } from "npm:zod@4";
 import {
   buildClientSchema,
@@ -96,6 +101,7 @@ const CommandSummarySchema = z.object({
   matchingEventsTruncated: z.boolean(),
 });
 const ResultSchema = z.object({
+  diagnostics: z.array(DiagnosticSchema).default([]),
   commandSummary: CommandSummarySchema.nullable().default(null),
   succeeded: z.boolean(),
   errorCount: z.number(),
@@ -149,6 +155,7 @@ async function operation(
       // An arbitrary document may mutate state. Never infer safety from text.
       retry: false,
       sensitiveResponse: true,
+      effect: selected.operation === "query" ? "read" : "write",
     },
   );
   const result = EnvelopeSchema.parse(body);
@@ -156,7 +163,21 @@ async function operation(
     "SkilJ GraphQL operation completed ({errorCount} errors)",
     { errorCount: result.errors?.length ?? 0 },
   );
-  return result;
+  return {
+    ...result,
+    diagnostics: (result.errors ?? []).map((error) =>
+      sanitizeDiagnostic({
+        surface: "graphql",
+        status: 200,
+        code: typeof error.extensions?.code === "string"
+          ? error.extensions.code
+          : null,
+        transport: null,
+        effect: selected.operation === "query" ? "read" : "write",
+        protected: false,
+      })
+    ),
+  };
 }
 
 const IntrospectionDocument = getIntrospectionQuery({
@@ -417,14 +438,23 @@ export const DebugCommandArgsSchema = z.object({
   payload: z.record(z.string(), z.unknown()),
 });
 
-function requireData(body: z.infer<typeof EnvelopeSchema>) {
+function requireData(
+  body: z.infer<typeof EnvelopeSchema> & {
+    diagnostics?: z.infer<typeof DiagnosticSchema>[];
+  },
+) {
   if (body.errors?.length || !body.data) {
     // Avoid echoing arbitrary server messages, which can contain input secrets.
-    throw new Error(
-      `SkilJ GraphQL returned ${
-        body.errors?.length ?? 0
-      } error(s); use execute to capture the protected error envelope`,
-    );
+    throw new Error(diagnosticMessage(
+      body.diagnostics?.[0] ?? {
+        surface: "graphql",
+        status: 200,
+        code: null,
+        transport: null,
+        effect: "write",
+        protected: false,
+      },
+    ));
   }
   return body.data;
 }
@@ -432,6 +462,7 @@ function requireData(body: z.infer<typeof EnvelopeSchema>) {
 /** GraphQL companion to the REST model, packaged in @gklijs/skilj. */
 export const model = {
   type: "@gklijs/skilj-graphql",
+  reports: ["@gklijs/skilj-report"],
   version: "2026.11.07.1",
   globalArguments: GlobalArgsSchema,
   upgrades: [{
@@ -845,6 +876,7 @@ export const model = {
         const result = ResultSchema.parse({
           succeeded: errors.length === 0,
           errorCount: errors.length,
+          diagnostics: body.diagnostics,
           data: body.data ?? null,
           errors,
         });
@@ -1047,6 +1079,7 @@ export const model = {
           commandSummary,
           succeeded: errors.length === 0,
           errorCount: errors.length,
+          diagnostics: body.diagnostics,
           data: body.data ?? null,
           errors,
         });

@@ -583,11 +583,12 @@ nothing and does not guarantee a later trigger.
 
 On either model, `debug: true` logs HTTP method, route, attempt, status and
 elapsed milliseconds. View these with `--log --show-properties`. Request
-diagnostics omit headers, query values and bodies; domain-outcome logs and
-server error messages can still include business values. Requests automatically
-propagate Swamp's W3C trace headers. Optional `traceparent` (version 00) and
-`tracestate` globals can override that context. An explicit parent does not
-inherit an unrelated tracestate. Domain `correlationId` remains separate.
+diagnostics omit headers, query values and bodies. Failure summaries use static
+advice and allowlisted codes; private rejection reasons remain in the result
+resource for authorized inspection. Requests automatically propagate Swamp's W3C
+trace headers. Optional `traceparent` (version 00) and `tracestate` globals can
+override that context. An explicit parent does not inherit an unrelated
+tracestate. Domain `correlationId` remains separate.
 
 Swamp cancellation aborts in-flight requests and retry waits immediately.
 Retryable REST calls honor `Retry-After` seconds and HTTP dates. If the server
@@ -607,6 +608,59 @@ swamp model method run withdrawn-events searchUsedTags \
 `upToSequence` reads history as known at that sequence, inclusive. Tag discovery
 uses a literal prefix, and both methods respect the token's event type and owner
 scope. Keep the same as-of bound when following `nextCursor` across runs.
+
+## Troubleshooting
+
+Inspect `@gklijs/skilj-report` after the explicitly invoked operation, including
+failed calls that produced no data artifact. Confirm retrieval syntax with
+`swamp help report get`. The report provides a category, sanitized HTTP status
+and code, static next step, documentation link and write/cursor uncertainty. It
+never runs a probe, retries a call or advances a consume cursor.
+
+| Signal                                                                             | Category                       | Next step                                                                                                                                                                                            |
+| ---------------------------------------------------------------------------------- | ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 403 `wrong_token_variant`                                                          | `wrong_capability`             | Select the capability kind required by this route, with the required owner scope.                                                                                                                    |
+| 403 `event_read_not_allowed`                                                       | `reads_disabled`               | Have the operator review the event type's `eventReadAllowed`; another token cannot enable reads.                                                                                                     |
+| 401 credential rejection; GraphQL `jwt_verification_failed` and related auth codes | `authentication`               | Check the vault credential; for GraphQL obtain a current IdP JWT and verify trusted IdP configuration and the active Role mapping. Decoding JWT claims does not verify validity or establish expiry. |
+| Inactive token/Role/grant or insufficient scope/access                             | `authorization`                | Have an authorized administrator review the token, Role, grant and required scope.                                                                                                                   |
+| GraphQL `no_identity_provider_configured`                                          | `authentication_configuration` | Have the deployment operator configure the trusted IdP.                                                                                                                                              |
+| 409 `epoch_changed`                                                                | `epoch_changed`                | Reconcile the checkpoint with the operator before establishing a cursor for the current epoch; do not consume again or acknowledge an old epoch blindly.                                             |
+| HTTP 429                                                                           | `rate_limit`                   | Honor `Retry-After` and the existing retry policy.                                                                                                                                                   |
+| Local timeout; HTTP 408/504                                                        | `timeout`                      | Reconcile any write outcome using authorized telemetry before another attempt.                                                                                                                       |
+| Transport failure; HTTP 502/503; GraphQL `jwks_fetch_failed`                       | `unavailable`                  | Check endpoint/dependency health and the existing retry policy.                                                                                                                                      |
+| Batch 409 `not_processed`                                                          | `not_processed`                | Resolve preceding failures and inspect every item before submitting items again.                                                                                                                     |
+| `accepted: false` without pending approval                                         | Business rejection             | Review business preconditions and private details through the result data pointer; successful HTTP execution does not imply acceptance.                                                              |
+| Unknown code/status pair or unstructured failure                                   | `unknown`                      | Inspect authorized server telemetry and data pointers; unknown codes and messages are omitted from summaries.                                                                                        |
+
+Timeouts and lost responses can leave a write's outcome uncertain even when an
+idempotency key or dedupe identity protects against duplicate effects. Reconcile
+first; any authorized retry must retain the original payload and key/identity.
+Never generate a new key to retry an old operation. For an unprotected write,
+reconcile before any replay. A lost consume response may have advanced a cursor
+or acquired a claim; reconcile served events and checkpoint state before
+consuming again. GraphQL mutations with errors may have partial effects and are
+never automatically retried. GraphQL queries are identified by parsing the
+selected operation, including named operations and fragments.
+
+GraphQL `execute` and `debugCommand` results expose safe `diagnostics[]`
+metadata alongside vault-protected `data` and `errors`. Partial data remains
+available for authorized inspection; check `succeeded` and `errorCount` before
+using it. Built-in GraphQL methods still throw on GraphQL errors. Failed calls
+carry a closed metadata envelope through Swamp's supported report `errorMessage`
+context; no diagnostic resource or successful result is invented. Reports
+rebuild advice from that envelope and never echo arbitrary error text. REST
+business rejection reasons and raw batch errors remain in their existing result
+resources, while reports and rejection logs omit those private values.
+
+The allowlist is checked against release commit
+`93874920a737f83ecc8936d33b495d8c7c262146` (tag `v0.4.0`):
+[REST error/status mapping](https://github.com/gklijs/SkilJ/blob/v0.4.0/skilj-rest/src/error.rs),
+[GraphQL authentication](https://github.com/gklijs/SkilJ/blob/v0.4.0/skilj-graphql/src/auth.rs),
+[core authentication codes](https://github.com/gklijs/SkilJ/blob/v0.4.0/skilj-core/src/access_control/mod.rs)
+and
+[event reading](https://github.com/gklijs/SkilJ/blob/v0.4.0/docs/rest-event-reading.md).
+Rate limits and gateway timeouts are classified by standard HTTP status, without
+inventing SkilJ server codes. Unknown status/code pairs stay unknown.
 
 ## Reusable command verification
 
@@ -697,7 +751,8 @@ ${{ data.latest("skilj-admin", "validation").attributes.valid }}
   (`true` when the requested limit was hit; otherwise `null` because the server
   provides no completeness/continuation signal).
 - `graphqlResult` (instances `graphql` and `debug`): `succeeded`, `errorCount`,
-  `commandSummary` (nullable), sensitive `data` and `errors`.
+  `commandSummary` (nullable), safe `diagnostics[]` metadata, sensitive `data`
+  and `errors`.
 - `tokenRevocation` (instance `revocation`): `id`, `tokenType`, `status`,
   `revokedAt`.
 - `schemaExport` (file `schema.json`): standard `data.__schema` introspection

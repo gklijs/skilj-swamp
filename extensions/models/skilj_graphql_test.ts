@@ -429,7 +429,7 @@ Deno.test("exportSchema writes no artifact on introspection errors", async () =>
     await assertRejects(
       () => model.methods.exportSchema.execute({}, f.ctx),
       Error,
-      "GraphQL returned",
+      "SkilJ HTTP 200",
     );
     assertEquals(f.files.length, 0);
   } finally {

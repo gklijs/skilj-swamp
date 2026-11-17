@@ -403,14 +403,14 @@ Deno.test("ingestExternalEvent records a key-based redelivery with its sequence"
   });
 });
 
-Deno.test("a network failure names the route", async () => {
+Deno.test("a network failure withholds transport exception text", async () => {
   globalThis.fetch = () => Promise.reject(new TypeError("connection refused"));
   const { ctx, written } = context();
   try {
     await assertRejects(
       () => model.methods.createDirectEvent.execute({ payload: {} }, ctx),
       Error,
-      "SkilJ POST /api/v1/events/direct could not be reached: TypeError: connection refused",
+      "The transport failed.",
     );
   } finally {
     globalThis.fetch = realFetch;
@@ -793,7 +793,7 @@ Deno.test("response body failures retain route context and respect retry safety"
       else {await assertRejects(
           () => model.methods.triggerCommand.execute({ payload: {} }, ctx),
           Error,
-          "POST /api/v1/commands/trigger",
+          "The transport failed.",
         );}
       assertEquals(calls, safe ? 2 : 1);
     } finally {
