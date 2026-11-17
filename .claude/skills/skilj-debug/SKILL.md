@@ -74,6 +74,59 @@ continuation cursor, so a short suggestion list does not prove completeness.
 inclusive, including SkilJ's correction and retraction semantics. Keep the bound
 across subsequent page calls.
 
+## Investigate captured correlation evidence
+
+Use an existing trigger result's `correlationId` when investigating an earlier
+operation. For a newly **explicitly requested** banking-demo withdrawal, retain
+its operation ID/idempotency key and pass a domain correlation ID:
+
+```bash
+swamp model method run withdraw triggerCommand \
+  --input '{"payload":{"account_id":"first-run-a","amount":25},"correlationId":"investigation-123","idempotencyKey":"RETAINED_OPERATION_ID"}'
+swamp data query 'modelName == "withdraw" && name == "trigger"' --select content --json
+```
+
+Inspect `accepted` and `pendingApproval`; never trigger just to populate a
+report or automatically approve a proposal. If an event read is authorized,
+capture the relevant token's visible events with the same correlation filter:
+
+```bash
+swamp model method run withdrawn-events fetchEvents \
+  --input '{"correlationId":"investigation-123","maxPages":5}'
+swamp data list withdraw --json
+swamp data list withdrawn-events --json
+```
+
+Choose the exact stored artifact versions from those lists; the `1` values below
+are examples to replace with those versions. No automatic selection of unrelated
+models or latest versions takes place. Create the report configuration model
+once, then run:
+
+```bash
+swamp model create @gklijs/skilj-investigation investigation
+swamp model method run investigation investigate \
+  --input '{"correlationId":"investigation-123","sources":[{"model":"withdraw","artifact":"trigger","version":1},{"model":"withdrawn-events","artifact":"events","version":1}],"maxArtifacts":20,"maxRows":200}'
+swamp report get @gklijs/skilj-correlation-timeline --model investigation --markdown
+swamp report get @gklijs/skilj-correlation-timeline --model investigation --json
+```
+
+The report reads only captured `commandResult`, `events` and `consumedEvents`
+artifacts through Swamp's repositories, without network calls. It includes exact
+versioned data pointers. Defaults are 20 artifacts and 200 inspected rows; hard
+caps are 100 artifacts and 1000 rows, including unrelated rows. The source list
+has at most 100 entries, and content over 2 MiB is skipped. Capped inputs,
+missing IDs/versions and truncated captures are marked as incomplete evidence.
+
+Each event lane is ordered within one stable connection model's capability
+stream, event type and known epoch. Duplicate metadata retains all capture
+pointers. Equal sequences across models or epochs stay separate. Keep connection
+models stable; never repurpose one for another deployment or capability stream.
+Command artifacts have no epoch and cannot establish a lane or causal edge from
+sequence alone. A shared correlation ID groups evidence without proving
+causation. Payloads, tags, credentials and free-text rejection reasons are
+excluded. This is captured evidence, not complete history: absent events never
+prove failure.
+
 ## Explain a command with GraphQL
 
 REST `dryRunCommand` reveals only acceptance/rejection. For matching history and

@@ -7,11 +7,13 @@ license: MIT
 models:
   - skilj.ts
   - skilj_graphql.ts
+  - skilj_investigation.ts
 workflows:
   - workflow-withdraw-and-verify.yaml
   - workflow-skilj-command-and-verify.yaml
 reports:
   - skilj_report.ts
+  - skilj_correlation_timeline.ts
 skills:
   - skilj-setup
   - skilj-workflows

@@ -713,6 +713,38 @@ Every method run emits `@gklijs/skilj-report`: a one-screen operator summary
 (accepted/rejected, counts, stored sequences) with the
 `swamp data get <model> <artifact>` pointer for the full resource.
 
+For an investigation across captured REST results, create an
+`@gklijs/skilj-investigation` model and run its `investigate` method. This emits
+`@gklijs/skilj-correlation-timeline` as Markdown and JSON. Supply a correlation
+ID and explicit `{model, artifact, version}` selections; the report reads only
+these local `commandResult`, `events` and `consumedEvents` versions. It never
+contacts SkilJ. See the bundled `skilj-debug` recipe for exact invocation.
+
+The report inspects at most `maxArtifacts: 20` artifacts and `maxRows: 200` rows
+by default, with hard caps of 100 artifacts and 1000 rows. The source selection
+itself is limited to 100 entries. Rows include unrelated events, so filtering
+cannot bypass the inspection cap. Artifacts larger than 2 MiB are skipped.
+Commands list at most 1000 safe event sequences, marking omitted/invalid
+metadata. Selections are processed in supplied order; missing artifacts do not
+trigger searches or refetches.
+
+Event lanes retain source model IDs, artifact versions and epochs. Matching
+metadata at the same sequence is deduplicated only within the same model's
+capability stream, event type and known epoch; all source pointers are retained.
+Use stable connection models for each capability stream. Separate models or
+epochs remain separate lanes, with no global ordering. Unknown stream identity
+prevents deduplication. The report does not join command sequences to event
+lanes because command artifacts have no epoch, and sharing a correlation ID does
+not establish causation. Only event type, sequence and correlation/causation
+identifiers are shown; payloads, tags, credentials and rejection text are
+omitted.
+
+This is **captured evidence, not complete history**. Missing correlation IDs,
+unavailable versions, invalid metadata, truncated captures and report caps carry
+explicit incomplete-evidence markers. Even a report with no detected gaps says
+nothing about uncaptured history; absent events do not establish command
+failure.
+
 ## Referencing results in CEL
 
 `data.latest(model, name)` takes the **artifact name**, which can differ from
