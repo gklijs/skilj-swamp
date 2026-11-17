@@ -16,3 +16,53 @@ jobs:
       - run: deno task test
       - run: deno task lint
       - run: deno task fmt:check
+
+  live-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        prefix: ["", "ledger"]
+    env:
+      SWAMP_NO_TELEMETRY: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
+        with:
+          deno-version: "2.9.7"
+      - name: Fetch pinned SkilJ 0.4.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: gklijs/SkilJ
+          ref: 93874920a737f83ecc8936d33b495d8c7c262146 # v0.4.0
+          path: upstream-skilj
+      - name: Build release demo
+        working-directory: upstream-skilj
+        run: |
+          rustup toolchain install stable --profile minimal
+          # The upstream release does not ship Cargo.lock.
+          cargo generate-lockfile
+          cargo build --locked -p skilj-demo --bin server
+      - name: Install pinned Swamp runtime
+        env:
+          SWAMP_RELEASE: v20261104.025555.0-sha.dd659114
+        run: |
+          base="https://github.com/swamp-club/swamp/releases/download/$SWAMP_RELEASE"
+          curl --fail --location "$base/swamp-linux-x86_64" --output swamp-linux-x86_64
+          curl --fail --location "$base/checksums.txt" --output checksums.txt
+          sha256sum --check --ignore-missing checksums.txt
+          chmod +x swamp-linux-x86_64
+          sudo mv swamp-linux-x86_64 /usr/local/bin/swamp
+      - name: Prepare disposable database image
+        run: docker pull postgres:17-alpine
+      - name: Live REST, GraphQL and bundled workflow contracts
+        env:
+          CONTRACT_PREFIX: ${{ matrix.prefix }}
+        run: >-
+          python3 scripts/test-live.py
+          --server upstream-skilj/target/debug/server
+          --deno "$(command -v deno)"
+          --prefix "$CONTRACT_PREFIX"
+      - name: Extension quality
+        run: swamp extension quality manifest.yaml --json

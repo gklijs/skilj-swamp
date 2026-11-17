@@ -15,7 +15,7 @@ import time
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--server", required=True, type=Path, help="SkilJ v0.3.0 skilj-demo server binary")
+    parser.add_argument("--server", required=True, type=Path, help="SkilJ v0.4.0 skilj-demo server binary")
     parser.add_argument("--deno", type=Path, default=Path.home() / ".swamp/deno/deno")
     parser.add_argument("--postgres-image", default="postgres:17-alpine", help="Pre-pulled Docker image")
     parser.add_argument("--prefix", default="ledger", help="Exercise federation-prefixed operations; empty for default names")
@@ -148,6 +148,9 @@ def main():
                             Path(swamp_env["SWAMP_REPO_DIR"]) / "workflows/workflow-skilj-command-and-verify.yaml")
             workflow = "@gklijs/skilj-command-and-verify"
             swamp("workflow", "validate", workflow)
+            shutil.copyfile(root / "workflows/workflow-withdraw-and-verify.yaml",
+                            Path(swamp_env["SWAMP_REPO_DIR"]) / "workflows/workflow-withdraw-and-verify.yaml")
+            swamp("workflow", "validate", "@gklijs/withdraw-and-verify")
             workflow_inputs = {
                 "commandModel": "native-command", "eventsModel": "native-events", "payload": {"account_id": "contract-a", "amount": 5}, "idempotencyKey": "native-withdraw-1",
             }

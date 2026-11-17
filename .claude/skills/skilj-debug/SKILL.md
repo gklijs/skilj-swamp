@@ -1,7 +1,7 @@
 ---
 name: skilj-debug
 description: >
-  Diagnose SkilJ 0.3.0 calls with @gklijs/skilj and @gklijs/skilj-graphql:
+  Diagnose SkilJ 0.4.0 calls with @gklijs/skilj and @gklijs/skilj-graphql:
   dry runs, DCB matching history, correlation traces, historical reads,
   GraphQL errors and schema introspection for frontend development.
 ---

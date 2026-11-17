@@ -1,4 +1,4 @@
-/** Opt-in contract test against an isolated SkilJ 0.3.0 demo deployment. */
+/** Opt-in contract test against an isolated SkilJ 0.4.0 demo deployment. */
 import {
   assert,
   assertEquals,

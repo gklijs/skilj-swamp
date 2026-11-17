@@ -8,10 +8,12 @@ description: >
 
 # SkilJ connections and tokens
 
-This extension targets SkilJ 0.3.0. Discover existing definitions with
-`swamp model search --json` and vaults with `swamp vault search --json` before
-creating anything. Inspect model arguments with
-`swamp model type describe @gklijs/skilj --json` or
+This extension targets SkilJ 0.4.0. For server upgrades, follow the README
+"Server compatibility and upgrades" section and the tagged upstream deployment
+guide; preflight and database migration belong to the application deployment.
+Discover existing definitions with `swamp model search --json` and vaults with
+`swamp vault search --json` before creating anything. Inspect model arguments
+with `swamp model type describe @gklijs/skilj --json` or
 `swamp model type describe @gklijs/skilj-graphql --json`. Confirm CLI details
 with `swamp help <command>` when needed.
 

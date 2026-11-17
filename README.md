@@ -5,10 +5,10 @@ Swamp models and bundled skills for the REST and GraphQL surfaces of a running
 event-sourced applications on Postgres that uses Dynamic Consistency Boundaries
 (DCB) instead of fixed aggregates.
 
-Targets **SkilJ 0.3.0**. The package includes `@gklijs/skilj` for REST
+Targets **SkilJ 0.4.0**. The package includes `@gklijs/skilj` for REST
 capability calls and `@gklijs/skilj-graphql` for Role-authenticated operations,
 token issuance, command debugging and frontend schema discovery. The extension
-uses CalVer (`2026.11.07.1`); that version is independent of SkilJ's release
+uses CalVer (`2026.11.17.1`); that version is independent of SkilJ's release
 number.
 
 With this model a swamp workflow can trigger commands, check whether a command
@@ -494,8 +494,17 @@ configuration. The lockfile makes local tests reproducible; the published
 GraphQL dependency is pinned in its import.
 
 For the live contract test, use Docker with a cached `postgres:17-alpine` image
-and a **SkilJ v0.3.0 demo server binary**, built in the SkilJ checkout with
-`cargo build --locked -p skilj-demo --bin server`:
+and a **SkilJ v0.4.0 demo server binary**, built in the SkilJ checkout with the
+exact release commit `93874920a737f83ecc8936d33b495d8c7c262146` (tag `v0.4.0`).
+The tag does not ship a Cargo lockfile; resolve dependencies before the locked
+build:
+
+```bash
+git clone --branch v0.4.0 --depth 1 https://github.com/gklijs/SkilJ.git
+cd SkilJ
+cargo generate-lockfile
+cargo build --locked -p skilj-demo --bin server
+```
 
 ```bash
 python3 scripts/test-live.py --server /path/to/SkilJ/target/debug/server
@@ -510,7 +519,50 @@ historical reads, tag discovery, manual consume/ack and the command verification
 workflow. The default prefix is `ledger`; use `--prefix ''` to exercise
 unprefixed names. It never connects to an existing application's database.
 
-The live test was run against the local SkilJ 0.3.0 demo and PostgreSQL 17.
+The live-contract CI job builds this pinned release and runs the harness twice,
+with default names (`--prefix ''`) and federation names (`--prefix ledger`). The
+fast unit job remains independent of Docker and Rust.
+
+Verified locally on 2026-11-17 against the exact release commit above with
+PostgreSQL 17 and Swamp `20261104.025555.0-sha.dd659114`: both `--prefix ''` and
+`--prefix ledger` completed successfully. Each run passed the live REST/GraphQL
+contract test, validated both bundled workflows, and exercised the generic
+command verification workflow, idempotent replay and the expected wrong-reader
+assertion failure. Deno's 88 unit tests, check, lint and fmt checks, and
+extension quality also passed. This records new 0.4.0 evidence; older releases
+have not been rerun as part of this baseline.
+
+## Server compatibility and upgrades
+
+The v0.3.0 and v0.4.0 tagged REST handlers, GraphQL resolvers and demo startup
+were compared against both extension models. Older servers are not covered by
+the current live-contract job.
+
+| Surface                                                | 0.4.0 comparison with 0.3.0                                                            | Extension behavior                                                      |
+| ------------------------------------------------------ | -------------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| REST commands, batches, dry run and event writes       | Request/response shapes unchanged                                                      | Existing acceptance, pending approval and idempotency handling retained |
+| REST reads, consume and acknowledgement                | Authorized reads move to SQL selection; public envelope unchanged                      | Existing epoch, cursor and no-retry consume rules retained              |
+| GraphQL tokens, proposals, introspection and debugging | Used field names and arguments unchanged                                               | Role JWT authentication and explicit approval retained                  |
+| Generic GraphQL operations                             | Fragment expansion budgets enforced; type registration/rebuild requires unscoped admin | Server errors remain errors; no automatic retries                       |
+| Demo startup                                           | Environment, generated Role JWT and banking fixtures unchanged                         | Disposable harness uses the same startup contract                       |
+| Database startup                                       | Migration 0010 and protected source redaction added                                    | Deployment responsibility; no extension migration API                   |
+
+Before upgrading an application from 0.3, stop **every 0.3 instance**. Take and
+verify a restorable backup. Run `SkiljBuilder::preflight` with production's
+configuration and registrations against a restored copy, and inspect pending
+migrations, unknown/refused checks and estimated table sizes. First startup
+redacts protected external source content under a lock that blocks event writes;
+plan a maintenance window. Migration 0010 prevents restarting 0.3 on the
+upgraded database (`VersionMissing`). Rollback requires restoring the
+pre-upgrade backup, including a plan for writes made after it.
+
+Preflight is a Rust application/deployment API, not an existing HTTP endpoint
+that this extension can invoke. A deployment can separately run
+`skilj::preflight::migrate` with a lock timeout, then start with
+`SchemaChanges::Refuse`. Follow the tagged
+[0.4.0 deployment guide](https://github.com/gklijs/SkilJ/blob/v0.4.0/docs/deployment.md)
+and
+[release changelog](https://github.com/gklijs/SkilJ/blob/v0.4.0/CHANGELOG.md).
 
 ## License
 
