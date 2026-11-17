@@ -11,6 +11,7 @@ import socket
 import subprocess
 import tempfile
 import time
+import uuid
 
 
 def main():
@@ -98,6 +99,9 @@ def main():
                     raise RuntimeError("Expected verification failure, got " + str(parsed.get("status")))
                 return parsed
             swamp("repo", "init", swamp_env["SWAMP_REPO_DIR"], "--tool", "none")
+            swamp("vault", "search")
+            config = (Path(swamp_env["SWAMP_REPO_DIR"]) / ".swamp.yaml").read_text()
+            assert re.search(r"^defaultVault: default$", config, re.MULTILINE), "Fresh repo has no default output vault"
             swamp("extension", "source", "add", str(root), "--only", "models,reports,workflows")
             swamp("vault", "put", "default", "role-jwt", stdin=match.group(1))
             swamp("model", "create", "@gklijs/skilj-graphql", "native-admin", "--global-arg", f"endpoint=http://127.0.0.1:{server_port}/graphql",
@@ -151,6 +155,91 @@ def main():
             shutil.copyfile(root / "workflows/workflow-withdraw-and-verify.yaml",
                             Path(swamp_env["SWAMP_REPO_DIR"]) / "workflows/workflow-withdraw-and-verify.yaml")
             swamp("workflow", "validate", "@gklijs/withdraw-and-verify")
+
+            # Execute the README's actual command blocks, so documentation and
+            # its CEL artifact references cannot drift from the bundled CLI.
+            # Source installation above replaces registry pull for unpublished
+            # changes; the fixture test opts its event types into REST reads.
+            readme = (root / "README.md").read_text()
+            demo = readme.split("### Demo connections\n", 1)[1].split("## Methods\n", 1)[0]
+            issuance = demo.split("**B. Role JWT and capability issuance.**", 1)[1]
+            blocks = re.findall(r"```bash\n(.*?)```", issuance, re.DOTALL)
+            assert len(blocks) == 7, "Update the walkthrough harness for the README's command blocks"
+            operation_id = str(uuid.uuid4())
+            replacements = {"https://skilj.example.com": f"http://127.0.0.1:{server_port}"}
+
+            def documented(block):
+                for placeholder, value in replacements.items():
+                    block = block.replace(placeholder, value)
+                block = block.replace(
+                    "--global-arg endpoint=",
+                    "--global-arg namingPrefix=" + args.prefix + " --global-arg endpoint=")
+                result = subprocess.run(["bash", "-euo", "pipefail", "-c", block],
+                                        text=True, capture_output=True,
+                                        env={**swamp_env, "operation_id": operation_id})
+                if result.returncode:
+                    # Do not echo arbitrary command output or secret resources.
+                    raise RuntimeError("README walkthrough command block failed; output withheld")
+
+            def artifact(model, name):
+                value = swamp("data", "query", f'modelName == "{model}" && name == "{name}"',
+                              "--select", "content", "--single")
+                return json.loads(value) if isinstance(value, str) else value
+
+            swamp("vault", "put", "default", "skilj-role-jwt", stdin=match.group(1))
+            documented(blocks[0].replace("swamp vault put default skilj-role-jwt\n", ""))
+            tokens = swamp("data", "query", 'modelName == "skilj-admin" && name.startsWith("token-")', "--select", "content")
+
+            def token_records(value):
+                if isinstance(value, str):
+                    try:
+                        yield from token_records(json.loads(value))
+                    except json.JSONDecodeError:
+                        pass
+                elif isinstance(value, dict):
+                    if "credential" in value and "typeName" in value:
+                        yield value
+                    else:
+                        for child in value.values():
+                            yield from token_records(child)
+                elif isinstance(value, list):
+                    for child in value:
+                        yield from token_records(child)
+
+            records = list(token_records(tokens))
+            assert len(records) == 3, "Walkthrough must issue three separate demo capabilities"
+            for placeholder, type_name in [("DEPOSIT_ID", "DepositMoney"), ("WITHDRAW_ID", "WithdrawMoney"), ("READ_ID", "MoneyWithdrawn")]:
+                record = next(record for record in records if record["typeName"] == type_name)
+                assert "vault.get" in record["credential"], "Walkthrough credential was not protected"
+                replacements["token-" + placeholder] = "token-" + record["id"]
+            documented(blocks[1])
+            # Keep the generated operation ID stable across separately executed
+            # blocks, just as it stays in the user's interactive shell.
+            documented("\n".join(blocks[2].splitlines()[1:]))
+            preview = artifact("deposit", "dryRun")
+            assert preview["accepted"] and preview["dryRun"] and preview["triggeredEventSequences"] == []
+            documented(blocks[3])
+            assert artifact("deposit", "trigger")["accepted"]
+            assert artifact("withdraw", "dryRun")["accepted"]
+            documented(blocks[4])
+            triggered = artifact("withdraw", "trigger")
+            assert triggered["accepted"] and not triggered["pendingApproval"]
+            events = artifact("withdrawn-events", "events")
+            matching = [event for event in events["events"] if event["sequence"] in triggered["triggeredEventSequences"]]
+            assert len(matching) == 1 and matching[0]["payload"] == {"account_id": "first-run-a", "amount": 25}
+            swamp("model", "method", "run", "withdrawn-events", "fetchEvents", "--input",
+                  json.dumps({"filters": [], "maxPages": 5, "after": events["nextCursor"]}))
+            assert artifact("withdrawn-events", "events")["events"] == [], "Client cursor repeated an event"
+            documented(blocks[5])
+            rejected = artifact("withdraw", "dryRun")
+            assert not rejected["accepted"] and rejected["rejectionReason"]
+            assert rejected["rejectionKind"] == "insufficient_funds"
+            documented(blocks[6])
+            # Replay the same operation; it must not withdraw another 5 units.
+            documented(blocks[6])
+            assert artifact("withdraw", "trigger")["deduplicated"]
+            print("PASS: README command blocks, defaultVault, protected artifact references, dry run, trigger, client cursor, rejection and verification workflow")
+
             workflow_inputs = {
                 "commandModel": "native-command", "eventsModel": "native-events", "payload": {"account_id": "contract-a", "amount": 5}, "idempotencyKey": "native-withdraw-1",
             }

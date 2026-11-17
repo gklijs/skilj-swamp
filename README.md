@@ -16,6 +16,253 @@ would be accepted, read events with a client-tracked cursor or a server-tracked
 consume cursor, acknowledge consumed events, feed events in from outside
 systems, and report parked broker deliveries.
 
+## Start here
+
+In a Swamp repository, install the extension:
+
+```bash
+swamp extension pull @gklijs/skilj
+```
+
+You need Swamp (the verified runtime version is listed under
+[Development](#development)), a reachable SkilJ 0.4.0 deployment, and permission
+to use its registered command/event types. Choose your credential entry path:
+
+- **Existing REST capability:** store `<id>.<secret>` in a vault and create one
+  `@gklijs/skilj` model per capability. You can read or dry-run with the
+  matching capability without a Role JWT. See [Setup](#setup).
+- **Role JWT:** store an IdP JWT resolving to an active SkilJ Role and create an
+  `@gklijs/skilj-graphql` model. Use it to inspect the schema; an admin context
+  mapping is required to issue REST capabilities. A JWT and a capability are
+  separate credentials. See
+  [GraphQL and token creation](#graphql-and-token-creation).
+
+For a complete command-to-event path, follow the demo below. For an existing
+application, substitute its registered names, payload schema and owner scope.
+Keep writes explicit: first read or dry-run, then trigger only the operation the
+user requested. Never automatically approve a pending proposal.
+
+| Task                                      | Where to go                                                                                |
+| ----------------------------------------- | ------------------------------------------------------------------------------------------ |
+| Inspect the deployed schema               | [GraphQL and token creation](#graphql-and-token-creation), bundled `skilj-frontend`        |
+| Store credentials or issue a token        | [Demo connections](#demo-connections), bundled `skilj-setup`                               |
+| Verify a command and its event            | [Reusable command verification](#reusable-command-verification), bundled `skilj-workflows` |
+| Choose read versus consume/ack            | [Methods](#methods) and [Usage](#usage), bundled `skilj-workflows`                         |
+| Diagnose rejection or HTTP/GraphQL errors | [Debugging](#debugging), bundled `skilj-debug`                                             |
+
+## Demo: from a command to its stored event
+
+### Prerequisites
+
+Use the supported **0.4.0 banking demo** in a disposable environment. Its exact
+names are context `banking`, commands `DepositMoney` / `WithdrawMoney`, and
+events `MoneyDeposited` / `MoneyWithdrawn`. Payloads use `account_id`, not
+`wallet_id`. These are the fixtures in
+[`tests/skilj_live_test.ts`](tests/skilj_live_test.ts).
+
+The deployment operator must intentionally enable `eventReadAllowed` for
+`MoneyWithdrawn`; the demo's default registration disables REST event reads. An
+event-read capability alone cannot enable them. The
+[disposable live harness](#development) prepares this registration for its
+fixture types, creates a test IdP and cleans up afterwards. Running the demo
+server and changing an application's registrations are deployment tasks, not
+part of installing this extension.
+
+Start with a fresh account `first-run-a`, no approval requirement on these demo
+commands, and permission to deposit 100 then withdraw 25. Replace
+`https://skilj.example.com` below with your demo URL. If the GraphQL schema has
+a federation prefix, add `--global-arg namingPrefix=ledger` (or your prefix)
+when creating `skilj-admin`; REST type names stay the same.
+
+The commands below use a Bash-compatible shell and Python 3 to generate a unique
+operation ID.
+
+For a new Swamp repository:
+
+```bash
+swamp repo init skilj-first-run --tool none
+cd skilj-first-run
+swamp extension pull @gklijs/skilj
+swamp vault search --json
+```
+
+Initialization creates the local encryption vault `default` and sets
+`defaultVault: default` in `.swamp.yaml`. For an existing repository, discover
+and reuse its vault. If missing, create it with
+`swamp vault create local_encryption default --json`, then set
+`defaultVault: default` in the existing `.swamp.yaml`, preserving other fields.
+Verify it is writable before token issuance. Input credentials and sensitive
+outputs can use different vaults; storing a JWT does not configure the output
+vault. Any workflow `vaults:` allow-list must include both.
+
+### Demo connections
+
+Choose **one** of these entry paths. Hidden vault prompts accept credentials;
+never paste them into command arguments, checked-in files or logs.
+
+**A. Existing capabilities.** Obtain a `DepositMoney` command capability, a
+`WithdrawMoney` command capability and a `MoneyWithdrawn` event-read capability
+for context `banking`, all covering `first-run-a`. Store them:
+
+```bash
+swamp vault put default skilj-deposit-token
+swamp vault put default skilj-withdraw-token
+swamp vault put default skilj-withdrawn-token
+```
+
+Create the connections:
+
+```bash
+swamp model create @gklijs/skilj deposit \
+  --global-arg baseUrl=https://skilj.example.com \
+  --global-arg 'token=${{ vault.get("default", "skilj-deposit-token") }}'
+swamp model create @gklijs/skilj withdraw \
+  --global-arg baseUrl=https://skilj.example.com \
+  --global-arg 'token=${{ vault.get("default", "skilj-withdraw-token") }}'
+swamp model create @gklijs/skilj withdrawn-events \
+  --global-arg baseUrl=https://skilj.example.com \
+  --global-arg 'token=${{ vault.get("default", "skilj-withdrawn-token") }}'
+```
+
+**B. Role JWT and capability issuance.** Use a Role with an admin mapping on
+`banking` to issue the three capabilities. Store the JWT and inspect the schema:
+
+```bash
+swamp vault put default skilj-role-jwt
+swamp model create @gklijs/skilj-graphql skilj-admin \
+  --global-arg endpoint=https://skilj.example.com/graphql \
+  --global-arg 'token=${{ vault.get("default", "skilj-role-jwt") }}'
+swamp model method run skilj-admin introspect
+swamp model method run skilj-admin createAccessToken \
+  --input '{"kind":"command","boundedContext":"banking","typeName":"DepositMoney"}'
+swamp model method run skilj-admin createAccessToken \
+  --input '{"kind":"command","boundedContext":"banking","typeName":"WithdrawMoney"}'
+swamp model method run skilj-admin createAccessToken \
+  --input '{"kind":"eventRead","boundedContext":"banking","typeName":"MoneyWithdrawn","startFrom":"BEGINNING"}'
+swamp data query 'modelName == "skilj-admin" && name.startsWith("token-")' --select content --json
+```
+
+These unscoped capabilities are for the disposable demo. For an application, use
+the required owner scope. Query results retain vault references for
+`credential`; do not resolve or print the secrets. Match each record's `kind`
+and `typeName`, and retain its exact `token-<id>` artifact name. Replace each
+placeholder below with that name, including the `token-` prefix:
+
+```bash
+swamp model create @gklijs/skilj deposit \
+  --global-arg baseUrl=https://skilj.example.com \
+  --global-arg 'token=${{ data.latest("skilj-admin", "token-DEPOSIT_ID").attributes.credential }}'
+swamp model create @gklijs/skilj withdraw \
+  --global-arg baseUrl=https://skilj.example.com \
+  --global-arg 'token=${{ data.latest("skilj-admin", "token-WITHDRAW_ID").attributes.credential }}'
+swamp model create @gklijs/skilj withdrawn-events \
+  --global-arg baseUrl=https://skilj.example.com \
+  --global-arg 'token=${{ data.latest("skilj-admin", "token-READ_ID").attributes.credential }}'
+```
+
+### Dry-run, explicitly trigger, then read
+
+Both credential paths continue here. Generate an operation ID once; retain it
+for retries of this walkthrough. Generate a new one for a new operation, and
+never reuse a key for a different payload:
+
+```bash
+operation_id="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+swamp model method run deposit dryRunCommand \
+  --input '{"payload":{"account_id":"first-run-a","amount":100}}'
+swamp data query 'modelName == "deposit" && name == "dryRun"' --select content --json
+```
+
+Expect `accepted: true`, `dryRun: true` and `triggeredEventSequences: []`.
+Nothing has been stored. Continue only when the deposit and withdrawal are
+explicitly requested. The next call **writes** the initial deposit:
+
+```bash
+swamp model method run deposit triggerCommand \
+  --input "{\"payload\":{\"account_id\":\"first-run-a\",\"amount\":100},\"idempotencyKey\":\"${operation_id}-deposit\"}"
+swamp data query 'modelName == "deposit" && name == "trigger"' --select content --json
+swamp model method run withdraw dryRunCommand \
+  --input '{"payload":{"account_id":"first-run-a","amount":25}}'
+swamp data query 'modelName == "withdraw" && name == "dryRun"' --select content --json
+```
+
+Check the deposit's `accepted` and the withdrawal dry run's `accepted` before
+continuing. A dry run reserves nothing; concurrent writes and approval policy
+can still affect the trigger. Now perform the requested withdrawal:
+
+```bash
+swamp model method run withdraw triggerCommand \
+  --input "{\"payload\":{\"account_id\":\"first-run-a\",\"amount\":25},\"idempotencyKey\":\"${operation_id}-withdraw\"}"
+swamp data query 'modelName == "withdraw" && name == "trigger"' --select content --json
+swamp model method run withdrawn-events fetchEvents \
+  --input '{"filters":[],"maxPages":5}'
+swamp data query 'modelName == "withdrawn-events" && name == "events"' --select content --json
+```
+
+Expect a `MoneyWithdrawn` event with payload
+`{"account_id":"first-run-a","amount":25}`. Confirm its `sequence` appears in
+the trigger's `triggeredEventSequences`; an unrelated event is not proof. The
+`events` artifact also includes `epoch`, `nextCursor`, `pages` and `truncated`.
+This is a client-tracked read: save the returned `nextCursor` and pass it as
+`after` for the next read, keeping filters unchanged. The cursor contains its
+epoch. Fetching does not advance a server consume cursor; see [Usage](#usage)
+for consume/ack instead.
+
+### Recognize the outcome and verify in a workflow
+
+A successful method execution, including HTTP 200, does **not** necessarily mean
+the command was accepted. Selected `trigger` fields look like this (sequence and
+proposal IDs vary):
+
+| Outcome          | Example fields                                                                                                 | Next step                                                             |
+| ---------------- | -------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
+| Accepted         | `{"accepted":true,"pendingApproval":false,"triggeredEventSequences":[42]}`                                     | Read and match an emitted sequence.                                   |
+| Rejected         | `{"accepted":false,"pendingApproval":false,"triggeredEventSequences":[],"rejectionKind":"insufficient_funds"}` | Inspect `rejectionReason`; stop the write path.                       |
+| Pending approval | `{"accepted":false,"pendingApproval":true,"proposalId":"<proposal-id>","triggeredEventSequences":[]}`          | Stop and request an explicit authorized decision. Never auto-approve. |
+
+To observe rejection without writing, dry-run a withdrawal larger than the demo
+balance:
+
+```bash
+swamp model method run withdraw dryRunCommand \
+  --input '{"payload":{"account_id":"first-run-a","amount":10000}}'
+swamp data query 'modelName == "withdraw" && name == "dryRun"' --select content --json
+```
+
+Expect `accepted: false` and a rejection reason. Pending approval occurs only
+when the deployment requires it; do not change that policy to force acceptance.
+The harness tests these outcomes in its disposable database.
+
+Use these CEL expressions in workflow assertions, without `${{ }}` around
+`task.expr`. `data.latest` takes the **artifact name**, not `commandResult`:
+
+```text
+data.latest("withdraw", "dryRun").attributes.accepted
+data.latest("withdraw", "trigger").attributes.accepted
+data.latest("withdrawn-events", "events").attributes.events.exists(e,
+  e.sequence in data.latest("withdraw", "trigger").attributes.triggeredEventSequences)
+```
+
+For the next explicitly requested withdrawal, the bundled generic workflow
+performs these checks. This is another write (5 units), so use a new key:
+
+```bash
+swamp workflow validate @gklijs/skilj-command-and-verify --json
+swamp workflow run @gklijs/skilj-command-and-verify --stdin <<EOF
+{
+  "commandModel": "withdraw",
+  "eventsModel": "withdrawn-events",
+  "payload": {"account_id": "first-run-a", "amount": 5},
+  "idempotencyKey": "${operation_id}-verify"
+}
+EOF
+```
+
+The workflow stops on rejection or pending approval and checks that the reader
+saw an emitted sequence. `@gklijs/withdraw-and-verify` is a separate `wallet_id`
+application example; use the generic workflow for this banking demo. The
+complete reference follows below.
+
 ## Methods
 
 | Method                 | Route                             | Token kind                             |
@@ -518,6 +765,14 @@ validation, token creation/revocation, idempotent and batched commands,
 historical reads, tag discovery, manual consume/ack and the command verification
 workflow. The default prefix is `ledger`; use `--prefix ''` to exercise
 unprefixed names. It never connects to an existing application's database.
+
+The runner also executes the README demo's Role-JWT connection and
+command-to-event Bash blocks, substituting only the local endpoint, federation
+prefix, generated operation ID and issued token artifact names. It injects the
+JWT through vault stdin. It checks the initialized `defaultVault`, protected
+credential references, dry-run outcomes, emitted sequence/payload, client cursor
+continuation and the verification workflow's idempotent replay. Local source
+installation replaces registry pull so unpublished changes are exercised.
 
 The live-contract CI job builds this pinned release and runs the harness twice,
 with default names (`--prefix ''`) and federation names (`--prefix ledger`). The

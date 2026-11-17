@@ -19,6 +19,13 @@ with `swamp help <command>` when needed.
 
 ## Choose the credential
 
+For first runs, follow the README's "Start here" and banking demo walkthrough:
+install with `swamp extension pull @gklijs/skilj`, check prerequisites and
+vaults, choose an existing REST capability or a Role JWT, then read or dry-run
+before any explicitly requested trigger. Keep the existing reference sections
+for method details. Do not start by issuing tokens if suitable capabilities
+already exist.
+
 - REST model `@gklijs/skilj`: a capability token in `<id>.<secret>` form. One
   model per token, event/command type and owner scope. Command tokens cover
   trigger, batch trigger and REST dry run; event-read tokens cover fetch,
@@ -79,6 +86,17 @@ broader capabilities than the task calls for.
 swamp model method run skilj-admin createAccessToken \
   --input '{"kind":"command","boundedContext":"Bank","typeName":"Withdraw","scope":"owner-1"}'
 ```
+
+That is an application-specific example. The supported 0.4.0 demo uses context
+`banking`, commands `DepositMoney` and `WithdrawMoney`, events `MoneyDeposited`
+and `MoneyWithdrawn`, and payloads such as
+`{"account_id":"first-run-a","amount":25}`. For the complete demo, connect a
+deposit command, withdrawal command and withdrawal event reader separately. Fund
+the fresh demo account with an explicitly requested deposit of 100 before
+withdrawing 25. The deployment must intentionally enable `eventReadAllowed` on
+`MoneyWithdrawn`; installation and token issuance do not do that. Use the
+README's generic command verification workflow rather than its separate
+`wallet_id` example. Never auto-approve a pending command.
 
 Kinds: `command`, `eventRead`, `externalEvent`, `directCreation`. The result's
 `accessToken.credential` is marked sensitive: Swamp stores it in the configured

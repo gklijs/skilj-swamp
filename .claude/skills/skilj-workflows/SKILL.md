@@ -13,6 +13,20 @@ DAG and validate it with `swamp workflow validate <name>` before executing it.
 For vault-backed connections, load the sibling `skilj-setup` skill when
 available.
 
+For a first run, follow the README's "Start here" and demo path first: install,
+check the deployment prerequisites, discover vaults, verify `defaultVault`, and
+choose existing REST capabilities or a separate GraphQL Role JWT. Inspect a read
+or dry-run outcome before an explicitly requested write. Input credential
+storage does not configure the vault for sensitive outputs.
+
+The supported SkilJ 0.4.0 banking demo uses context `banking`, command types
+`DepositMoney` / `WithdrawMoney`, and events `MoneyDeposited` /
+`MoneyWithdrawn`. Payloads contain `account_id`, not `wallet_id`. A fresh demo
+account needs an explicitly requested deposit before withdrawal, and the
+deployment must opt the reader's event type into `eventReadAllowed`. Use the
+generic `@gklijs/skilj-command-and-verify` workflow with these exact payloads;
+`@gklijs/withdraw-and-verify` is a separate wallet application example.
+
 `data.latest` takes the artifact name, not its spec: REST command results use
 `dryRun` and `trigger`; GraphQL results use `graphql` and `debug`; validation
 uses `validation`; consumed batches use `consume`. Use `data.findBySpec` when
