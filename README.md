@@ -861,9 +861,15 @@ credential references, dry-run outcomes, emitted sequence/payload, client cursor
 continuation and the verification workflow's idempotent replay. Local source
 installation replaces registry pull so unpublished changes are exercised.
 
-The live-contract CI job builds this pinned release and runs the harness twice,
-with default names (`--prefix ''`) and federation names (`--prefix ledger`). The
-fast unit job remains independent of Docker and Rust.
+The live-contract CI job builds this pinned release and runs the harness with
+both default names (`--prefix ''`) and federation names (`--prefix ledger`). Set
+the GitHub Actions secret `SWAMP_API_KEY` to a Swamp collective token to enable
+the bundled workflow tests and extension quality check. The optional
+`SWAMP_SIGNIN_TOKEN` lets Swamp start when swamp-club.com is unreachable. Runs
+without an API key, including fork pull requests, run the direct REST and
+GraphQL contracts and emit a warning about the skipped checks. The fast unit job
+remains independent of Docker and Rust. See the
+[Swamp account requirements](https://swamp-club.com/manual/reference/swamp-account-requirement#ci).
 
 Verified locally on 2026-11-17 against the exact release commit above with
 PostgreSQL 17 and Swamp `20261104.025555.0-sha.dd659114`: both `--prefix ''` and

@@ -59,10 +59,15 @@ jobs:
       - name: Live REST, GraphQL and bundled workflow contracts
         env:
           CONTRACT_PREFIX: ${{ matrix.prefix }}
-        run: >-
-          python3 scripts/test-live.py
-          --server upstream-skilj/target/debug/server
-          --deno "$(command -v deno)"
-          --prefix "$CONTRACT_PREFIX"
-      - name: Extension quality
-        run: swamp extension quality manifest.yaml --json
+          SWAMP_API_KEY: ${{ secrets.SWAMP_API_KEY }}
+          SWAMP_SIGNIN_TOKEN: ${{ secrets.SWAMP_SIGNIN_TOKEN }}
+        run: |
+          args=(--server upstream-skilj/target/debug/server
+                --deno "$(command -v deno)" --prefix "$CONTRACT_PREFIX")
+          if [[ -z "$SWAMP_API_KEY" ]]; then
+            echo "::warning::SWAMP_API_KEY is unavailable. Running direct REST and GraphQL contracts only."
+            python3 scripts/test-live.py "${args[@]}" --direct-only
+          else
+            python3 scripts/test-live.py "${args[@]}"
+            swamp extension quality manifest.yaml --json
+          fi

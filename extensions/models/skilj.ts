@@ -633,12 +633,17 @@ function toEventTypeInfo(body: Record<string, unknown>) {
 export const model = {
   type: "@gklijs/skilj",
   reports: ["@gklijs/skilj-report"],
-  version: "2026.11.07.1",
+  version: "2026.11.17.1",
   globalArguments: GlobalArgsSchema,
   upgrades: [{
     toVersion: "2026.11.07.1",
     description:
       "SkilJ 0.3.0 features; existing connection arguments remain compatible",
+    upgradeAttributes: (old: Record<string, unknown>) => old,
+  }, {
+    toVersion: "2026.11.17.1",
+    description:
+      "SkilJ 0.4.0 support and safe diagnostics; existing connection arguments remain compatible",
     upgradeAttributes: (old: Record<string, unknown>) => old,
   }],
 

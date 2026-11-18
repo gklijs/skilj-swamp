@@ -463,11 +463,16 @@ function requireData(
 export const model = {
   type: "@gklijs/skilj-graphql",
   reports: ["@gklijs/skilj-report"],
-  version: "2026.11.07.1",
+  version: "2026.11.17.1",
   globalArguments: GlobalArgsSchema,
   upgrades: [{
     toVersion: "2026.11.07.1",
     description: "Initial GraphQL connection schema",
+    upgradeAttributes: (old: Record<string, unknown>) => old,
+  }, {
+    toVersion: "2026.11.17.1",
+    description:
+      "SkilJ 0.4.0 support and safe diagnostics; existing connection arguments remain compatible",
     upgradeAttributes: (old: Record<string, unknown>) => old,
   }],
   files: {

@@ -20,6 +20,7 @@ def main():
     parser.add_argument("--deno", type=Path, default=Path.home() / ".swamp/deno/deno")
     parser.add_argument("--postgres-image", default="postgres:17-alpine", help="Pre-pulled Docker image")
     parser.add_argument("--prefix", default="ledger", help="Exercise federation-prefixed operations; empty for default names")
+    parser.add_argument("--direct-only", action="store_true", help="Run the direct REST and GraphQL contract without Swamp")
     args = parser.parse_args()
     server_binary = args.server.resolve(strict=True)
     deno = args.deno.resolve(strict=True)
@@ -71,7 +72,7 @@ def main():
                         "SKILJ_TEST_JWT": match.group(1), "SKILJ_TEST_PREFIX": args.prefix}
             completed = subprocess.run([str(deno), "test", "--allow-net=127.0.0.1",
                 "--allow-env=NODE_ENV,SKILJ_TEST_URL,SKILJ_TEST_JWT,SKILJ_TEST_PREFIX", "tests/skilj_live_test.ts"], cwd=root, env=test_env)
-            if completed.returncode:
+            if completed.returncode or args.direct_only:
                 return completed.returncode
             # Exercise Swamp's bundled runtime, vaults and declarative workflow
             # against the same isolated server, rather than only direct calls.
